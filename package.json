@@ -1,0 +1,19 @@
+{
+    "name": "determined",
+    "version": "0.1.0",
+    "type": "module",
+    "main": "./index.ts",
+    "exports": { ".": "./index.ts" },
+    "dependencies": {
+        "@glideapps/ts-necessities": "^2.4.0",
+        "neverthrow": "^8.2.0"
+    },
+    "devDependencies": {
+        "@types/node": "^24.10.1",
+        "typescript": "^5.9.3"
+    },
+    "scripts": {
+        "test": "node --experimental-strip-types --test *.test.ts",
+        "typecheck": "tsc"
+    }
+}
