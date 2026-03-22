@@ -10,6 +10,22 @@ In production, concurrent tasks run with real async scheduling, real randomness,
 - **Failpoints** can be injected probabilistically to test error paths.
 - **Failures are reproducible**: record the entropy, replay it, get the exact same execution.
 
+## Installation
+
+```bash
+npm install determined
+```
+
+Works with both ESM and CommonJS:
+
+```typescript
+// ESM
+import { SimulationImpl, noSimulation, Mutex, ConditionVariable } from "determined";
+
+// CJS
+const { SimulationImpl, noSimulation, Mutex, ConditionVariable } = require("determined");
+```
+
 ## Modules
 
 ### simulation.ts
