@@ -37,7 +37,7 @@ The core of the framework. Defines the `SimulationTask` interface and two implem
 The interface every task function receives. It extends `Logger` and `EntropySource` and provides:
 
 - **`checkpoint(...log)`** — A yield point. The task suspends and the scheduler picks which task to resume next. Use this at every point where you want the simulation to explore different interleavings.
-- **`failpoint(...log)`** — Like checkpoint, but may also inject a simulated failure (an `ApplicationFailure`) based on `failureProbability`. If the failpoint passes, it acts as a scheduling point. When `failureProbability` is 0, no entropy is consumed for the fail decision (important for replay determinism).
+- **`failpoint(...log)`** — Like checkpoint, but may also inject a simulated failure (an `ApplicationFailure`) based on `failureProbability`. If the failpoint passes, it acts as a scheduling point. When `failureProbability` is 0, no entropy is consumed for the fail decision (important for replay determinism). If `failpointSuccessReduction` is configured above 0, consecutive failures of the same failpoint log key make future failures of that same key more likely; a success resets the key.
 - **`blockpoint(...log)`** — Marks the task as blocked (waiting on an external condition like a mutex or condition variable). Unlike checkpoint, blocked tasks are excluded from scheduling until something unblocks them. If all tasks are blocked, the simulation detects deadlock.
 - **`abortSimulation(error)`** — Immediately aborts the entire simulation run with the given error.
 - **`random(reason)`** — Returns a random number in [0, 1) from the simulation's entropy source.
@@ -48,10 +48,17 @@ The interface every task function receives. It extends `Logger` and `EntropySour
 The deterministic simulation runner. Constructed with:
 
 ```typescript
-new SimulationImpl(logger: Logger, entropy: EntropySource, failureProbability: number)
+new SimulationImpl(
+    logger: Logger,
+    entropy: EntropySource,
+    failureProbability: number,
+    failpointSuccessReduction: number,
+)
 ```
 
 Call `runTasks(specs)` with an array of `TaskSpec` objects. Each spec has a `name` and an async function `f` that receives a `SimulationTask`. All tasks start at an implicit `checkpoint("START")`, and the scheduler picks which one runs first.
+
+`failpointSuccessReduction` must be passed explicitly; use `0` to disable cascading failpoint probability. It reduces success probability after each consecutive failure of the same failpoint "thing". The thing is derived from the failpoint `...log` arguments by converting each to a string and joining them. For example, with `failureProbability = 0.1`, base success probability is `0.9`; after one failure and `failpointSuccessReduction = 0.5`, the next success probability for the same failpoint is `0.9 * (1 - 0.5)`, so the failure probability is `0.55`. A successful failpoint clears the accumulated failure streak.
 
 Returns `Result<T[], Error>` — either the array of results (in spec order) or the first error that occurred.
 
@@ -219,7 +226,7 @@ class ConsoleLogger implements Logger {
 
 // Run with recording
 const recording = new RecordingEntropySource(new SimpleEntropySource());
-const sim = new SimulationImpl(new ConsoleLogger(), recording, 0.05);
+const sim = new SimulationImpl(new ConsoleLogger(), recording, 0.05, 0);
 
 const result = await sim.runTasks([
     { name: "writer", f: (task) => writer(task, data) },
@@ -238,7 +245,7 @@ if (result.isErr()) {
 ```typescript
 const file = JSON.parse(await fs.readFile("failure.json", "utf-8"));
 const replay = new ReplayingEntropySource(file.record);
-const sim = new SimulationImpl(new ConsoleLogger(), replay, 0.05);
+const sim = new SimulationImpl(new ConsoleLogger(), replay, 0.05, 0);
 
 // Produces the exact same scheduling decisions and failpoint outcomes
 const result = await sim.runTasks([
@@ -266,7 +273,7 @@ The playground pattern: run thousands of iterations with different random entrop
 ```typescript
 for (let i = 0; i < 1000; i++) {
     const entropy = new RecordingEntropySource(new SimpleEntropySource());
-    const sim = new SimulationImpl(logger, entropy, failureProbability);
+    const sim = new SimulationImpl(logger, entropy, failureProbability, 0);
 
     const result = await runMyTest(sim);
 
@@ -280,7 +287,7 @@ for (let i = 0; i < 1000; i++) {
 
     // Verify replay produces the same result
     const replayEntropy = new ReplayingEntropySource(entropy.getRecords());
-    const replaySim = new SimulationImpl(logger, replayEntropy, failureProbability);
+    const replaySim = new SimulationImpl(logger, replayEntropy, failureProbability, 0);
     const replayResult = await runMyTest(replaySim);
     assert(result.isOk() === replayResult.isOk(), "Replay must match original");
 }
