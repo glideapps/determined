@@ -49,7 +49,7 @@ describe("noSimulation", () => {
 describe("SimulationImpl", () => {
     describe("basic task execution", () => {
         it("single task runs and returns its result", async () => {
-            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([]), 0, 0);
+            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([]), () => 0);
             const result = await sim.runTasks([
                 { name: "task1", f: async () => 42 },
             ]);
@@ -62,7 +62,7 @@ describe("SimulationImpl", () => {
             //   1. START: [A, B] -> 0 -> A
             //   2. A at "step": [A, B] -> 0 -> A again, A finishes
             //   Then only B remains -> no entropy needed
-            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0, 0]), 0, 0);
+            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0, 0]), () => 0);
             const result = await sim.runTasks([
                 {
                     name: "A",
@@ -84,7 +84,7 @@ describe("SimulationImpl", () => {
         });
 
         it("empty task list returns ok with empty array", async () => {
-            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([]), 0, 0);
+            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([]), () => 0);
             const result = await sim.runTasks([]);
             assert.ok(result.isOk());
             assert.deepStrictEqual(result.value, []);
@@ -95,7 +95,7 @@ describe("SimulationImpl", () => {
         // Uses event traces (not logs) to assert actual execution order
         async function runWithEntropy(values: number[]): Promise<string[]> {
             const order: string[] = [];
-            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource(values), 0, 0);
+            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource(values), () => 0);
             const result = await sim.runTasks([
                 {
                     name: "A",
@@ -151,9 +151,9 @@ describe("SimulationImpl", () => {
     });
 
     describe("failpoints", () => {
-        it("with failureProbability 0, failpoints never fail and no entropy consumed for fail decision", async () => {
+        it("with failpoint probability 0, failpoints never fail and no entropy consumed for fail decision", async () => {
             // No entropy values provided - would throw if any were consumed
-            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([]), 0, 0);
+            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([]), () => 0);
             const result = await sim.runTasks([
                 {
                     name: "task1",
@@ -167,9 +167,9 @@ describe("SimulationImpl", () => {
             assert.deepStrictEqual(result.value, [42]);
         });
 
-        it("with failureProbability 1, failpoints always fail with ApplicationFailure", async () => {
+        it("with failpoint probability 1, failpoints always fail with ApplicationFailure", async () => {
             // 1 entropy value for the fail decision
-            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0.5]), 1, 0);
+            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0.5]), () => 1);
             const result = await sim.runTasks([
                 {
                     name: "task1",
@@ -186,7 +186,7 @@ describe("SimulationImpl", () => {
 
         it("intermediate probability: entropy < prob fails, entropy >= prob passes", async () => {
             // Prob = 0.5, entropy = 0.7 -> 0.7 >= 0.5 -> pass
-            const sim1 = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0.7]), 0.5, 0);
+            const sim1 = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0.7]), () => 0.5);
             const result1 = await sim1.runTasks([
                 {
                     name: "task1",
@@ -200,7 +200,7 @@ describe("SimulationImpl", () => {
             assert.deepStrictEqual(result1.value, ["passed"]);
 
             // Prob = 0.5, entropy = 0.3 -> 0.3 < 0.5 -> fail
-            const sim2 = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0.3]), 0.5, 0);
+            const sim2 = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0.3]), () => 0.5);
             const result2 = await sim2.runTasks([
                 {
                     name: "task1",
@@ -213,86 +213,26 @@ describe("SimulationImpl", () => {
             assert.ok(result2.isErr());
         });
 
-        it("can make repeated failures of the same failpoint more likely, and reset on success", async () => {
-            const outcomes: string[] = [];
-            const sim = new SimulationImpl(
-                new ArrayLogger(),
-                new FixedEntropySource([0.05, 0.2, 0.5, 0.8, 0.2]),
-                0.1,
-                0.5,
-            );
-
-            async function recordFailpoint(
-                task: SimulationTask,
-                outcome: string,
-                ...log: readonly unknown[]
-            ): Promise<void> {
-                try {
-                    await task.failpoint(...log);
-                    outcomes.push(`${outcome}-passed`);
-                } catch (e: unknown) {
-                    assert.ok(isApplicationFailure(e));
-                    outcomes.push(`${outcome}-failed`);
-                }
-            }
+        it("uses failpoint log arguments to compute failure probability", async () => {
+            const calls: Array<readonly unknown[]> = [];
+            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0.5]), (...log) => {
+                calls.push(log);
+                return log[0] === "fail" ? 1 : 0;
+            });
 
             const result = await sim.runTasks([
                 {
                     name: "task1",
                     f: async (task: SimulationTask) => {
-                        // Base failure probability is 0.1, so 0.05 fails.
-                        await recordFailpoint(task, "same1", "fp", 1);
-                        // Different log arguments are a different "thing", so this still uses 0.1 and passes.
-                        await recordFailpoint(task, "other", "fp", 2);
-                        // Previous failure of ["fp", 1] reduced success from 0.9 to 0.45, so failure is 0.55.
-                        await recordFailpoint(task, "same2", "fp", 1);
-                        // Two failures reduce success to 0.225, so failure is 0.775; 0.8 passes and resets.
-                        await recordFailpoint(task, "same3", "fp", 1);
-                        // Reset means this is back to base failure probability 0.1, so 0.2 passes.
-                        await recordFailpoint(task, "same4", "fp", 1);
-                        return outcomes;
+                        await task.failpoint("pass", 1);
+                        await task.failpoint("fail", 2);
                     },
                 },
             ]);
 
-            assert.ok(result.isOk());
-            assert.deepStrictEqual(result.value, [
-                [
-                    "same1-failed",
-                    "other-passed",
-                    "same2-failed",
-                    "same3-passed",
-                    "same4-passed",
-                ],
-            ]);
-        });
-
-        it("clears failpoint failure history between successful runs", async () => {
-            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0.05, 0.2]), 0.1, 0.5);
-
-            const result1 = await sim.runTasks([
-                {
-                    name: "task1",
-                    f: async (task: SimulationTask) => {
-                        try {
-                            await task.failpoint("fp");
-                        } catch (e: unknown) {
-                            assert.ok(isApplicationFailure(e));
-                        }
-                    },
-                },
-            ]);
-            assert.ok(result1.isOk());
-
-            const result2 = await sim.runTasks([
-                {
-                    name: "task1",
-                    f: async (task: SimulationTask) => {
-                        await task.failpoint("fp");
-                    },
-                },
-            ]);
-            assert.ok(result2.isOk());
+            assert.ok(result.isErr());
+            assert.ok(isApplicationFailure(result.error));
+            assert.deepStrictEqual(calls, [["pass", 1], ["fail", 2]]);
         });
 
         it("failpoint failure aborts run while other tasks are parked", async () => {
@@ -302,7 +242,7 @@ describe("SimulationImpl", () => {
             //   2. A checkpoints, pick from [A, B]: 0.999 -> B
             //   3. B failpoint fail decision: 0.3 < 0.5 -> fail
             const order: string[] = [];
-            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0, 0.999, 0.3]), 0.5, 0);
+            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0, 0.999, 0.3]), () => 0.5);
             const result = await sim.runTasks([
                 {
                     name: "A",
@@ -331,7 +271,7 @@ describe("SimulationImpl", () => {
         it("failpoint forwards decorated name to entropy source", async () => {
             // Entropy: 1 for fail decision
             const spy = new SpyEntropySource([0.9]);
-            const sim = new SimulationImpl(new ArrayLogger(), spy, 0.5, 0);
+            const sim = new SimulationImpl(new ArrayLogger(), spy, () => 0.5);
             const result = await sim.runTasks([
                 {
                     name: "myTask",
@@ -354,7 +294,7 @@ describe("SimulationImpl", () => {
             //   3. Failpoint scheduling pick from [A, B]: 0.999 -> B
             // B runs before A continues, proving failpoint yields control
             const order: string[] = [];
-            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0, 0.9, 0.999]), 0.5, 0);
+            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0, 0.9, 0.999]), () => 0.5);
             const result = await sim.runTasks([
                 {
                     name: "A",
@@ -381,7 +321,7 @@ describe("SimulationImpl", () => {
 
     describe("error handling", () => {
         it("task throwing a regular error returns err", async () => {
-            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([]), 0, 0);
+            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([]), () => 0);
             const result = await sim.runTasks([
                 {
                     name: "task1",
@@ -393,7 +333,7 @@ describe("SimulationImpl", () => {
         });
 
         it("abortSimulation returns err", async () => {
-            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([]), 0, 0);
+            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([]), () => 0);
             const result = await sim.runTasks([
                 {
                     name: "task1",
@@ -413,7 +353,7 @@ describe("SimulationImpl", () => {
             //   2. A checkpoints, pick from [A, B, C]: 0.5 -> floor(0.5*3)=1 -> B
             //   3. B blockpoints, pick from [A, C] (2 items): 0.999 -> C
             const order: string[] = [];
-            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0, 0.5, 0.999]), 0, 0);
+            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0, 0.5, 0.999]), () => 0);
             const result = await sim.runTasks([
                 {
                     name: "A",
@@ -450,7 +390,7 @@ describe("SimulationImpl", () => {
     describe("deadlock detection", () => {
         it("all tasks blocked produces an error", async () => {
             // Entropy: pick first task from [A, B] at START
-            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0]), 0, 0);
+            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0]), () => 0);
             const result = await sim.runTasks([
                 {
                     name: "A",
@@ -475,7 +415,7 @@ describe("SimulationImpl", () => {
     describe("instance reuse", () => {
         it("SimulationImpl can be reused after a successful run", async () => {
             // Single-task runs need no entropy (sample short-circuits for 1 item)
-            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([]), 0, 0);
+            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([]), () => 0);
 
             const r1 = await sim.runTasks([
                 { name: "first", f: async () => 1 },
@@ -494,7 +434,7 @@ describe("SimulationImpl", () => {
         // instance is permanently poisoned. This may be a bug rather than a
         // contract — the test exists to prevent silent behavior changes.
         it("SimulationImpl is poisoned after a failed run", async () => {
-            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([]), 0, 0);
+            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([]), () => 0);
 
             const r1 = await sim.runTasks([
                 { name: "fail", f: async () => { throw new Error("boom"); } },
@@ -510,7 +450,7 @@ describe("SimulationImpl", () => {
 
         // Same as above: documents current poisoning behavior after deadlock.
         it("SimulationImpl is poisoned after deadlock", async () => {
-            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0]), 0, 0);
+            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0]), () => 0);
 
             const r1 = await sim.runTasks([
                 {
@@ -556,7 +496,7 @@ describe("SimulationImpl", () => {
             //   5. B resolves START, runs, hits B-cp. 1 item, auto-resolved.
             //   6. B resolves B-cp, pushes "B", finishes.
             const order: string[] = [];
-            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0, 0.5, 0.999]), 0, 0);
+            const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0, 0.5, 0.999]), () => 0);
             const result = await sim.runTasks([
                 { name: "A", f: async () => { order.push("A"); return "a"; } },
                 {
@@ -586,7 +526,7 @@ describe("SimulationImpl", () => {
         it("task.random() delegates to simulation entropy with decorated name", async () => {
             // Entropy: 1 for scheduling (START pick), 1 for task.random()
             const spy = new SpyEntropySource([0, 0.42]);
-            const sim = new SimulationImpl(new ArrayLogger(), spy, 0, 0);
+            const sim = new SimulationImpl(new ArrayLogger(), spy, () => 0);
             let randomValue = 0;
             const result = await sim.runTasks([
                 {

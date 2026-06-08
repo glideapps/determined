@@ -127,9 +127,7 @@ interface TaskInfo {
 export class SimulationImpl implements Simulation {
     private readonly logger: Logger;
     private readonly entropy: EntropySource;
-    private readonly failureProbability: number;
-    private readonly failpointSuccessReduction: number;
-    private readonly failpointFailureStreaks = new Map<string, number>();
+    private readonly failpointFailureProbability: (...log: readonly unknown[]) => number;
     // FIXME: Should this just be a `TaskInfo[]`, since we never look at the task anyway?
     private readonly taskInfos = new Map<SimulationTask, TaskInfo>();
     private abortedWithError: unknown;
@@ -137,37 +135,11 @@ export class SimulationImpl implements Simulation {
     constructor(
         logger: Logger,
         entropy: EntropySource,
-        failureProbability: number,
-        failpointSuccessReduction: number,
+        failpointFailureProbability: (...log: readonly unknown[]) => number,
     ) {
-        assert(failureProbability >= 0 && failureProbability <= 1, "failureProbability must be between 0 and 1");
-        assert(
-            failpointSuccessReduction >= 0 && failpointSuccessReduction <= 1,
-            "failpointSuccessReduction must be between 0 and 1",
-        );
         this.logger = logger;
         this.entropy = entropy;
-        this.failureProbability = failureProbability;
-        this.failpointSuccessReduction = failpointSuccessReduction;
-    }
-
-    private failpointKey(log: readonly unknown[]): string {
-        return log.map(String).join("\x1f");
-    }
-
-    private effectiveFailpointFailureProbability(key: string): number {
-        const failureStreak = this.failpointFailureStreaks.get(key) ?? 0;
-        const successProbability =
-            (1 - this.failureProbability) * (1 - this.failpointSuccessReduction) ** failureStreak;
-        return 1 - successProbability;
-    }
-
-    private recordFailpointOutcome(key: string, failed: boolean): void {
-        if (failed) {
-            this.failpointFailureStreaks.set(key, (this.failpointFailureStreaks.get(key) ?? 0) + 1);
-        } else {
-            this.failpointFailureStreaks.delete(key);
-        }
+        this.failpointFailureProbability = failpointFailureProbability;
     }
 
     private abort(e: unknown): never {
@@ -215,7 +187,6 @@ export class SimulationImpl implements Simulation {
         >
     > {
         const simulation = this;
-        this.failpointFailureStreaks.clear();
 
         const tasksAndInfos = specs.map((s) => {
             const info: TaskInfo = { name: s.name, resolve: undefined };
@@ -250,12 +221,14 @@ export class SimulationImpl implements Simulation {
                         `Task ${s.name} wants to failpoint, but doesn't exist anymore`,
                     );
 
-                    const failpointKey = simulation.failpointKey(log);
-                    const failureProbability = simulation.effectiveFailpointFailureProbability(failpointKey);
+                    const failureProbability = simulation.failpointFailureProbability(...log);
+                    assert(
+                        failureProbability >= 0 && failureProbability <= 1,
+                        "failpointFailureProbability must return a value between 0 and 1",
+                    );
                     const shouldFail =
                         failureProbability > 0 &&
                         simulation.entropy.random(`${s.name} failpoint: ${log.join(" ")}`) < failureProbability;
-                    simulation.recordFailpointOutcome(failpointKey, shouldFail);
                     if (shouldFail) {
                         simulation.logger.log(`${s.name} FAILING:`, ...log);
                         return Promise.reject(

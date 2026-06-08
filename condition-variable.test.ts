@@ -7,7 +7,7 @@ import { ArrayLogger, FixedEntropySource } from "./test-helpers.ts";
 describe("ConditionVariable", () => {
     it("wait + notifyAll basic flow", async () => {
         // Entropy: pick waiter first from [waiter, notifier]
-        const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0]), 0, 0);
+        const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0]), () => 0);
         const cv = new ConditionVariable("test");
         const order: string[] = [];
 
@@ -41,7 +41,7 @@ describe("ConditionVariable", () => {
         //   1. Pick from [w1, w2, notifier] (3 items): 0 -> w1
         //   2. Pick from [w2, notifier] (2 items): 0 -> w2
         //   3. After notify, pick from [w1, w2] (2 items): 0 -> w1
-        const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0, 0, 0]), 0, 0);
+        const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0, 0, 0]), () => 0);
         const cv = new ConditionVariable("test");
         const order: string[] = [];
 
@@ -78,7 +78,7 @@ describe("ConditionVariable", () => {
     });
 
     it("notifyAll with no waiters does not throw", async () => {
-        const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([]), 0, 0);
+        const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([]), () => 0);
         const cv = new ConditionVariable("test");
 
         const result = await sim.runTasks([
@@ -96,7 +96,7 @@ describe("ConditionVariable", () => {
 
     it("wait blocks until notified", async () => {
         // Pick waiter first
-        const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0]), 0, 0);
+        const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0]), () => 0);
         const cv = new ConditionVariable("test");
         const order: string[] = [];
 
@@ -132,7 +132,7 @@ describe("ConditionVariable", () => {
         // Entropy:
         //   1. Pick from [waiter, notifier]: 0 -> waiter
         //   2. After first notify + checkpoint, pick from [waiter, notifier]: 0 -> waiter
-        const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0, 0]), 0, 0);
+        const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0, 0]), () => 0);
         const cv = new ConditionVariable("test");
         const order: string[] = [];
 
@@ -165,7 +165,7 @@ describe("ConditionVariable", () => {
 
     it("notify-before-wait causes deadlock (notifications are not sticky)", async () => {
         // Entropy: pick notifier first (0.999 -> index 1 of [waiter, notifier])
-        const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0.999]), 0, 0);
+        const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0.999]), () => 0);
         const cv = new ConditionVariable("test");
         const order: string[] = [];
 
