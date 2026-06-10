@@ -26,6 +26,32 @@ export class FixedEntropySource implements EntropySource {
     }
 }
 
+/**
+ * Like FixedEntropySource, but throws exactly once, at the given draw index,
+ * then continues serving the fixed values. Models a DST resource guard that
+ * throws from random() and recovers (e.g. a transient guard trip). Draws that
+ * throw do not consume a value.
+ */
+export class ThrowOnceEntropySource implements EntropySource {
+    private readonly values: number[];
+    private readonly throwAtDraw: number;
+    private draw = 0;
+    private valueIndex = 0;
+    constructor(values: number[], throwAtDraw: number) {
+        this.values = values;
+        this.throwAtDraw = throwAtDraw;
+    }
+    random(): number {
+        const draw = this.draw;
+        this.draw++;
+        if (draw === this.throwAtDraw) throw new Error("entropy guard trip");
+        const v = this.values[this.valueIndex];
+        if (v === undefined) throw new Error(`ThrowOnceEntropySource exhausted at draw ${draw}`);
+        this.valueIndex++;
+        return v;
+    }
+}
+
 /** Like FixedEntropySource but also records the names passed to random(). */
 export class SpyEntropySource implements EntropySource {
     readonly calledNames: string[] = [];

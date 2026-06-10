@@ -7,7 +7,7 @@ import {
     type SimulationTask,
 } from "./simulation.ts";
 import { isApplicationFailure } from "./errors.ts";
-import { ArrayLogger, FixedEntropySource, SpyEntropySource } from "./test-helpers.ts";
+import { ArrayLogger, FixedEntropySource, SpyEntropySource, ThrowOnceEntropySource } from "./test-helpers.ts";
 
 describe("NoSimulationTask", () => {
     it("checkpoint resolves immediately", async () => {
@@ -475,6 +475,193 @@ describe("SimulationImpl", () => {
                 { name: "ok", f: async () => 42 },
             ]);
             assert.ok(r2.isErr(), "reused SimulationImpl after deadlock should still be poisoned");
+        });
+    });
+
+    describe("entropy source that throws (resource-guard skips)", () => {
+        // DST harnesses guard against non-converging iterations with entropy
+        // sources that throw from random() once a budget or deadline trips.
+        // Such a throw can surface inside the scheduling pick of
+        // unlockIfNecessary(), i.e. inside the park call (checkpoint /
+        // failpoint / blockpoint) of whichever task parked last — after that
+        // park has already registered its resolve. The park must be
+        // exception-safe: the just-registered resolve has to be deregistered
+        // before the error propagates into the task, because the task is not
+        // parked — it is running its error path. Otherwise the scheduler is
+        // corrupted: "Task X already has a resolve" asserts on the next park,
+        // wake-ups delivered to abandoned promises, and abandoned *rejected*
+        // promises that escalate to process-fatal unhandled rejections.
+
+        it("failpoint: entropy throw from the scheduling pick leaves the task parkable again", async () => {
+            // Entropy draws (fpProb 0, so failpoints draw nothing for the fail decision):
+            //   0. START pick from [victim, swallower]: 0.999 -> swallower
+            //   1. swallower parks at fp(0); pick from [victim, swallower]: THROWS
+            //      -> propagates synchronously out of failpoint() into swallower,
+            //         which swallows it (models a best-effort cleanup step)
+            //   2. swallower parks at fp(1); pick from [victim, swallower]: 0.999 -> swallower
+            //   then swallower finishes; victim is the only task left -> no more draws
+            const entropy = new ThrowOnceEntropySource([0.999, 0.999], 1);
+            const errors: string[] = [];
+            const sim = new SimulationImpl(new ArrayLogger(), entropy, () => 0);
+            const result = await sim.runTasks([
+                {
+                    name: "victim",
+                    f: async (task: SimulationTask) => {
+                        await task.checkpoint("v");
+                        return "v";
+                    },
+                },
+                {
+                    name: "swallower",
+                    f: async (task: SimulationTask) => {
+                        for (let i = 0; i < 2; i++) {
+                            try {
+                                await task.failpoint("fp", i);
+                            } catch (e) {
+                                errors.push(e instanceof Error ? e.message : String(e));
+                            }
+                        }
+                        return "s";
+                    },
+                },
+            ]);
+            assert.ok(result.isOk(), `expected ok, got err: ${result.isErr() ? result.error.message : ""}`);
+            assert.deepStrictEqual(result.value, ["v", "s"]);
+            // Only the guard trip reaches the task; the second park must work
+            // normally (with a stale resolve it rejects with "Task swallower
+            // already has a resolve" instead).
+            assert.deepStrictEqual(errors, ["entropy guard trip"]);
+        });
+
+        it("checkpoint: entropy throw from the scheduling pick leaves the task parkable again", async () => {
+            // Same entropy trace as the failpoint variant (checkpoints never
+            // draw for a fail decision).
+            const entropy = new ThrowOnceEntropySource([0.999, 0.999], 1);
+            const errors: string[] = [];
+            const sim = new SimulationImpl(new ArrayLogger(), entropy, () => 0);
+            const result = await sim.runTasks([
+                {
+                    name: "victim",
+                    f: async (task: SimulationTask) => {
+                        await task.checkpoint("v");
+                        return "v";
+                    },
+                },
+                {
+                    name: "swallower",
+                    f: async (task: SimulationTask) => {
+                        for (let i = 0; i < 2; i++) {
+                            try {
+                                await task.checkpoint("cp", i);
+                            } catch (e) {
+                                errors.push(e instanceof Error ? e.message : String(e));
+                            }
+                        }
+                        return "s";
+                    },
+                },
+            ]);
+            assert.ok(result.isOk(), `expected ok, got err: ${result.isErr() ? result.error.message : ""}`);
+            assert.deepStrictEqual(result.value, ["v", "s"]);
+            assert.deepStrictEqual(errors, ["entropy guard trip"]);
+        });
+
+        it("a tripped budget guard (throws on every later draw) does not leak unhandled rejections", async () => {
+            // FixedEntropySource throws once exhausted — on EVERY draw after
+            // that, exactly like a tripped draw-budget guard. With a stale
+            // resolve, the next park's internal assert rejects the new park
+            // promise inside its executor, and the subsequent throw from the
+            // scheduling pick abandons that rejected promise -> a process-level
+            // unhandled rejection (the fatal variant of this bug).
+            // Draws:
+            //   0. START pick from [victim, swallower]: 0.999 -> swallower
+            //   1+. every later draw throws "FixedEntropySource exhausted"
+            const unhandled: string[] = [];
+            const onUnhandled = (reason: unknown): void => {
+                unhandled.push(reason instanceof Error ? reason.message : String(reason));
+            };
+            process.on("unhandledRejection", onUnhandled);
+            try {
+                const errors: string[] = [];
+                const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0.999]), () => 0);
+                const result = await sim.runTasks([
+                    {
+                        name: "victim",
+                        f: async (task: SimulationTask) => {
+                            await task.checkpoint("v");
+                            return "v";
+                        },
+                    },
+                    {
+                        name: "swallower",
+                        f: async (task: SimulationTask) => {
+                            for (let i = 0; i < 2; i++) {
+                                try {
+                                    await task.failpoint("fp", i);
+                                } catch (e) {
+                                    errors.push(e instanceof Error ? e.message : String(e));
+                                }
+                            }
+                            return "s";
+                        },
+                    },
+                ]);
+                // Let any pending unhandled rejections be reported.
+                await new Promise((resolve) => setImmediate(resolve));
+                assert.ok(result.isOk(), `expected ok, got err: ${result.isErr() ? result.error.message : ""}`);
+                assert.deepStrictEqual(result.value, ["v", "s"]);
+                assert.strictEqual(errors.length, 2);
+                for (const e of errors) {
+                    assert.match(e, /exhausted/, `task must only ever see the guard error, got: ${e}`);
+                }
+                assert.deepStrictEqual(unhandled, []);
+            } finally {
+                process.off("unhandledRejection", onUnhandled);
+            }
+        });
+
+        it("a swallowed abortSimulation followed by parks does not corrupt the scheduler", async () => {
+            // Once the simulation is aborted, unlockIfNecessary() rethrows the
+            // abort error on every subsequent park — also after the resolve was
+            // registered. Same exception-safety requirement as the entropy
+            // throw. Single task: no scheduling picks, no entropy draws at all.
+            const unhandled: string[] = [];
+            const onUnhandled = (reason: unknown): void => {
+                unhandled.push(reason instanceof Error ? reason.message : String(reason));
+            };
+            process.on("unhandledRejection", onUnhandled);
+            try {
+                const errors: string[] = [];
+                const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([]), () => 0);
+                const result = await sim.runTasks([
+                    {
+                        name: "solo",
+                        f: async (task: SimulationTask) => {
+                            try {
+                                task.abortSimulation(new Error("stop"));
+                            } catch {
+                                // models a runner that survives the abort throw
+                            }
+                            for (let i = 0; i < 2; i++) {
+                                try {
+                                    await task.checkpoint("after-abort", i);
+                                } catch (e) {
+                                    errors.push(e instanceof Error ? e.message : String(e));
+                                }
+                            }
+                        },
+                    },
+                ]);
+                await new Promise((resolve) => setImmediate(resolve));
+                // The simulation is aborted either way.
+                assert.ok(result.isErr());
+                assert.strictEqual(result.error.message, "stop");
+                // Both parks must see the abort error (not a scheduler assert).
+                assert.deepStrictEqual(errors, ["stop", "stop"]);
+                assert.deepStrictEqual(unhandled, []);
+            } finally {
+                process.off("unhandledRejection", onUnhandled);
+            }
         });
     });
 
