@@ -448,6 +448,38 @@ describe("SimulationImpl", () => {
             assert.ok(r2.isErr(), "reused SimulationImpl should still be poisoned");
         });
 
+        it("SimulationImpl is poisoned after an entropy throw during the START pick", { timeout: 5000 }, async () => {
+            // The last task's START checkpoint triggers the first scheduling
+            // pick (draw 0). A guard throw there propagates synchronously out
+            // of the .map() in runTasks, bypassing the per-task abort handler
+            // — but it must still poison the instance: the failed run's tasks
+            // are left in taskInfos forever (their .finally cleanup never
+            // runs), so a later runTasks on the same instance would see the
+            // thrower's entry as "still running" and deadlock waiting for it,
+            // or ghost-wake a parked orphan.
+            // Entropy: draw 0 throws once; recovers afterwards.
+            const entropy = new ThrowOnceEntropySource([0.0, 0.0, 0.0], 0);
+            const sim = new SimulationImpl(new ArrayLogger(), entropy, () => 0);
+            let ghostRan = false;
+            const r1 = await sim.runTasks([
+                {
+                    name: "orphan",
+                    f: async (task: SimulationTask) => {
+                        ghostRan = true;
+                        await task.checkpoint("never");
+                    },
+                },
+                { name: "trigger", f: async () => "t" },
+            ]);
+            assert.ok(r1.isErr());
+            assert.strictEqual(r1.error.message, "entropy guard trip");
+            assert.strictEqual(ghostRan, false);
+
+            const r2 = await sim.runTasks([{ name: "fresh", f: async () => 42 }]);
+            assert.ok(r2.isErr(), "instance must be poisoned after the failed run");
+            assert.strictEqual(ghostRan, false, "orphaned task from the failed run must not be woken as a ghost");
+        });
+
         // Same as above: documents current poisoning behavior after deadlock.
         it("SimulationImpl is poisoned after deadlock", async () => {
             const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([0]), () => 0);

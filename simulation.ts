@@ -308,6 +308,17 @@ export class SimulationImpl implements Simulation {
             )) as any; // I wish we could type this better
             return ok(results);
         } catch (e: unknown) {
+            // A synchronous throw out of a START checkpoint (e.g. an entropy
+            // guard tripping during the scheduling pick) propagates out of the
+            // `.map()` above, bypassing the per-task abort handler. The failed
+            // run's tasks then stay in `taskInfos` forever (their `.finally`
+            // cleanup never runs), so the instance must be poisoned like any
+            // other failed run — otherwise a later `runTasks` would deadlock
+            // waiting on the thrower's "still running" entry, or ghost-wake a
+            // parked task from the failed run.
+            if (this.abortedWithError === undefined) {
+                this.abortedWithError = e;
+            }
             return err(exceptionToError(e));
         }
     }
