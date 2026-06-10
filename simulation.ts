@@ -156,6 +156,28 @@ export class SimulationImpl implements Simulation {
         return task;
     }
 
+    /**
+     * Runs `unlockIfNecessary` on behalf of a task that has just parked
+     * (registered its `resolve` at a checkpoint/failpoint/blockpoint).
+     * `unlockIfNecessary` can throw — the entropy source may throw from the
+     * scheduling pick (DST resource guards like draw budgets do this), and an
+     * aborted simulation rethrows its abort error. Such a throw propagates
+     * synchronously out of the park call into the parking task, which is
+     * therefore NOT parked — it is running its error path. Its just-registered
+     * `resolve` must be deregistered, otherwise the bookkeeping is corrupted:
+     * the next park trips `assert(info.resolve === undefined)` ("Task X
+     * already has a resolve"), and a wake-up meant for a live task can be
+     * delivered to the abandoned promise instead.
+     */
+    private unlockIfNecessaryAfterPark(info: TaskInfo): void {
+        try {
+            this.unlockIfNecessary();
+        } catch (e) {
+            info.resolve = undefined;
+            throw e;
+        }
+    }
+
     private unlockIfNecessary(): void {
         if (this.abortedWithError !== undefined) throw this.abortedWithError;
 
@@ -212,7 +234,7 @@ export class SimulationImpl implements Simulation {
                         assert(info.resolve === undefined || info.resolve === false);
                         info.resolve = resolve;
                     });
-                    simulation.unlockIfNecessary();
+                    simulation.unlockIfNecessaryAfterPark(info);
                     return promise;
                 },
                 failpoint(...log: readonly unknown[]): Promise<void> {
@@ -244,7 +266,7 @@ export class SimulationImpl implements Simulation {
                         );
                         info.resolve = resolve;
                     });
-                    simulation.unlockIfNecessary();
+                    simulation.unlockIfNecessaryAfterPark(info);
                     return promise;
                 },
                 blockpoint(...log: readonly unknown[]): void {
@@ -252,7 +274,7 @@ export class SimulationImpl implements Simulation {
                     assert(simulation.taskInfos.has(task));
                     assert(info.resolve === undefined, `Task ${s.name} already has a resolve`);
                     info.resolve = false;
-                    simulation.unlockIfNecessary();
+                    simulation.unlockIfNecessaryAfterPark(info);
                 },
                 abortSimulation(e): never {
                     return simulation.abort(e);
@@ -286,6 +308,17 @@ export class SimulationImpl implements Simulation {
             )) as any; // I wish we could type this better
             return ok(results);
         } catch (e: unknown) {
+            // A synchronous throw out of a START checkpoint (e.g. an entropy
+            // guard tripping during the scheduling pick) propagates out of the
+            // `.map()` above, bypassing the per-task abort handler. The failed
+            // run's tasks then stay in `taskInfos` forever (their `.finally`
+            // cleanup never runs), so the instance must be poisoned like any
+            // other failed run — otherwise a later `runTasks` would deadlock
+            // waiting on the thrower's "still running" entry, or ghost-wake a
+            // parked task from the failed run.
+            if (this.abortedWithError === undefined) {
+                this.abortedWithError = e;
+            }
             return err(exceptionToError(e));
         }
     }
