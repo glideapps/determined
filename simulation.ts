@@ -23,10 +23,20 @@ export interface SimulationTask extends Logger, EntropySource {
      * entropy-chosen point at or after the deadline, so a longer sleep may
      * complete before a shorter one. Negative or non-finite durations throw
      * a `TypeError`.
+     *
+     * Aborting the optional signal removes the pending timer and rejects the
+     * sleep with `signal.reason` — the same contract as Node's cancellable
+     * `setTimeout` from `timers/promises`. A sleep given an already-aborted
+     * signal rejects immediately, registers no timer, and consumes no
+     * entropy.
      */
-    sleep(durationMs: number, reason: string): Promise<void>;
+    sleep(durationMs: number, reason: string, options?: SleepOptions): Promise<void>;
 
     abortSimulation(e: unknown): never;
+}
+
+export interface SleepOptions {
+    readonly signal?: AbortSignal;
 }
 
 export interface SimulationOptions {
@@ -109,10 +119,24 @@ export class NoSimulationTask implements SimulationTask {
         return Date.now();
     }
 
-    public sleep(durationMs: number, reason: string): Promise<void> {
+    public sleep(durationMs: number, reason: string, options?: SleepOptions): Promise<void> {
         validateSleepDuration(durationMs, reason);
+        const signal = options?.signal;
+        if (signal?.aborted) {
+            return Promise.reject(signal.reason);
+        }
         this.log(`sleep "${reason}" for ${durationMs}ms`);
-        return new Promise((resolve) => setTimeout(resolve, durationMs));
+        return new Promise((resolve, reject) => {
+            const onAbort = (): void => {
+                clearTimeout(timer);
+                reject(signal?.reason);
+            };
+            const timer = setTimeout(() => {
+                signal?.removeEventListener("abort", onAbort);
+                resolve();
+            }, durationMs);
+            signal?.addEventListener("abort", onAbort, { once: true });
+        });
     }
 
     public abortSimulation(e: unknown): never {
@@ -405,36 +429,68 @@ export class SimulationImpl implements Simulation {
                 wallNow(): number {
                     return simulation.wallClockEpoch + simulation.monotonic;
                 },
-                sleep(durationMs: number, reason: string): Promise<void> {
+                sleep(durationMs: number, reason: string, options?: SleepOptions): Promise<void> {
                     validateSleepDuration(durationMs, reason);
                     assert(simulation.taskInfos.has(task), `Task ${s.name} wants to sleep, but doesn't exist anymore`);
+                    const signal = options?.signal;
+                    if (signal?.aborted) {
+                        // The abort event has already fired and will not fire
+                        // again, so parking would sleep forever. Reject
+                        // immediately: no timer, no entropy.
+                        simulation.logger.log(
+                            `${s.name} SLEEP '${reason}' rejected at t=${simulation.monotonic}ms: signal already aborted`,
+                        );
+                        return Promise.reject(signal.reason);
+                    }
                     const deadline = simulation.monotonic + durationMs;
                     simulation.logger.log(
                         `${s.name} SLEEP '${reason}' at t=${simulation.monotonic}ms for ${durationMs}ms until t=${deadline}ms`,
                     );
                     let timerId: number | undefined;
-                    const promise = new Promise<void>((resolve) => {
+                    let detachAbort: (() => void) | undefined;
+                    const promise = new Promise<void>((resolve, reject) => {
                         assert(info.resolve === undefined, `Task ${s.name} already has a resolve`);
                         // The task sleeps in its single park slot: blocked
-                        // like a blockpoint, woken by exactly one timer. The
-                        // timer's `fire` flips the slot to a schedulable
-                        // continuation; the scheduler then picks the task
-                        // like any other checkpointed one.
+                        // like a blockpoint, woken by exactly one of two
+                        // events — its timer firing, or its signal aborting.
+                        // Each event flips the slot to a schedulable
+                        // continuation and disarms the other, so the task
+                        // can never be woken twice.
                         info.resolve = false;
                         info.parkReason = `sleeping '${reason}' until t=${deadline}ms`;
                         timerId = simulation.registerTimer(`${s.name} sleep: ${reason}`, deadline, () => {
+                            detachAbort?.();
                             info.parkReason = undefined;
                             info.resolve = resolve;
                         });
+                        if (signal !== undefined) {
+                            const onAbort = (): void => {
+                                // Dispatches synchronously in the aborter's
+                                // stack. The sleeper merely becomes
+                                // schedulable — the aborter continues until
+                                // it parks, and the entropy scheduler picks
+                                // up the aborted sleeper later.
+                                assert(timerId !== undefined, "Abort hook ran before the sleep timer was registered");
+                                simulation.timers.delete(timerId);
+                                simulation.logger.log(
+                                    `TIMER '${s.name} sleep: ${reason}' cancelled by abort at t=${simulation.monotonic}ms`,
+                                );
+                                info.parkReason = undefined;
+                                info.resolve = () => reject(signal.reason);
+                            };
+                            signal.addEventListener("abort", onAbort, { once: true });
+                            detachAbort = () => signal.removeEventListener("abort", onAbort);
+                        }
                     });
                     // Exception safety: a synchronous throw out of the
                     // scheduling that follows the park (entropy guard, abort)
                     // means the task is NOT sleeping — it is running its
-                    // error path. Both the park slot and the just-registered
-                    // timer must be rolled back, otherwise the timer would
-                    // later ghost-wake a task that isn't parked.
+                    // error path. The park slot, the just-registered timer,
+                    // and the abort hook must all be rolled back, otherwise
+                    // either could later ghost-wake a task that isn't parked.
                     simulation.unlockIfNecessaryAfterPark(info, () => {
                         if (timerId !== undefined) simulation.timers.delete(timerId);
+                        detachAbort?.();
                     });
                     return promise;
                 },

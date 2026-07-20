@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert";
 import { SimulationImpl, type SimulationTask } from "./simulation.ts";
 import { RecordingEntropySource, ReplayingEntropySource, SimpleEntropySource } from "./entropy.ts";
+import { isCancellation } from "./errors.ts";
 import { ConditionVariable } from "./condition-variable.ts";
 import { ArrayLogger, FixedEntropySource } from "./test-helpers.ts";
 
@@ -268,6 +269,119 @@ describe("deterministic sleep", () => {
         ]);
         assert.ok(result.isOk());
         assert.ok(caught instanceof TypeError, `expected TypeError, got ${String(caught)}`);
+    });
+
+    // Acceptance test 7 (abort path): aborting a sleep cancels its timer —
+    // the timer cannot wake the task later, and virtual time does not
+    // advance to the abandoned deadline.
+    it("aborting a sleep rejects it with the abort reason and cancels its timer", async () => {
+        const order: string[] = [];
+        const stop = new Error("stop requested");
+        const controller = new AbortController();
+        let caught: unknown;
+        // Entropy:
+        //   0. START pick from [sleeper, aborter]: 0 -> sleeper; it sleeps
+        //      (10,000ms) and parks; aborter is forced.
+        //   aborter aborts the signal — the sleeper becomes schedulable, but
+        //   the aborter continues until it finishes (non-preemptive).
+        //   Then everything is forced: the sleeper's rejection, its second
+        //   sleep's timer (the only pending timer if — and only if — the
+        //   aborted 10,000ms timer was really cancelled; a leaked timer
+        //   would consume an extra entropy draw and exhaust the source).
+        const sim = makeSim([0]);
+        const result = await sim.runTasks([
+            {
+                name: "sleeper",
+                f: async (task: SimulationTask) => {
+                    try {
+                        await task.sleep(10_000, "long nap", { signal: controller.signal });
+                    } catch (e) {
+                        caught = e;
+                        order.push("sleeper-aborted");
+                    }
+                    assert.strictEqual(task.monotonicNow(), 0, "abort must not advance virtual time");
+                    await task.sleep(5, "short nap");
+                    return task.monotonicNow();
+                },
+            },
+            {
+                name: "aborter",
+                f: async () => {
+                    order.push("aborter-before");
+                    controller.abort(stop);
+                    order.push("aborter-after");
+                    return -1;
+                },
+            },
+        ]);
+        assert.ok(result.isOk(), `expected ok, got err: ${result.isErr() ? result.error.message : ""}`);
+        // The aborter ran to completion before the sleeper was woken.
+        assert.deepStrictEqual(order, ["aborter-before", "aborter-after", "sleeper-aborted"]);
+        // The sleep rejected with exactly the signal's abort reason.
+        assert.strictEqual(caught, stop);
+        // The second sleep advanced time to 5, not to the abandoned 10,000ms
+        // deadline.
+        assert.strictEqual(result.value[0], 5);
+    });
+
+    it("a sleep aborted with the default reason rejects with a cancellation", async () => {
+        const controller = new AbortController();
+        let caught: unknown;
+        const sim = makeSim([0]);
+        const result = await sim.runTasks([
+            {
+                name: "sleeper",
+                f: async (task: SimulationTask) => {
+                    try {
+                        await task.sleep(1_000, "nap", { signal: controller.signal });
+                    } catch (e) {
+                        caught = e;
+                    }
+                },
+            },
+            {
+                name: "aborter",
+                f: async () => {
+                    controller.abort();
+                },
+            },
+        ]);
+        assert.ok(result.isOk(), `expected ok, got err: ${result.isErr() ? result.error.message : ""}`);
+        assert.ok(isCancellation(caught), `expected a cancellation, got ${String(caught)}`);
+    });
+
+    // Acceptance test 17: a sleep given an already-aborted signal rejects
+    // immediately with the abort reason — no timer is registered and no
+    // entropy is consumed.
+    it("a pre-aborted signal rejects the sleep immediately, without a timer or entropy", async () => {
+        const reason = new Error("already shut down");
+        const controller = new AbortController();
+        controller.abort(reason);
+        let caught: unknown;
+        // Single task: every choice is forced, and FixedEntropySource([])
+        // throws on any draw.
+        const sim = makeSim([]);
+        const result = await sim.runTasks([
+            {
+                name: "A",
+                f: async (task: SimulationTask) => {
+                    try {
+                        await task.sleep(10_000, "nap", { signal: controller.signal });
+                    } catch (e) {
+                        caught = e;
+                    }
+                    assert.strictEqual(task.monotonicNow(), 0);
+                    // The only pending timer must be this one — a leaked
+                    // timer from the rejected sleep would make the pick
+                    // non-forced and consume entropy.
+                    await task.sleep(5, "short");
+                    return task.monotonicNow();
+                },
+            },
+        ]);
+        assert.ok(result.isOk(), `expected ok, got err: ${result.isErr() ? result.error.message : ""}`);
+        assert.strictEqual(caught, reason);
+        assert.strictEqual(result.value[0], 5);
     });
 
     it("a zero-duration sleep yields through the scheduler without advancing time", async () => {
