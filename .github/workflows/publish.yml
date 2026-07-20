@@ -28,8 +28,10 @@ jobs:
             - run: npm test
 
             # Take the version from the release tag (strip a leading "v").
+            # --allow-same-version: npm errors on a no-op version change,
+            # which would fail releases whose tag matches package.json.
             - name: Set version from release tag
-              run: npm version --no-git-tag-version "${TAG#v}"
+              run: npm version --no-git-tag-version --allow-same-version "${TAG#v}"
               env:
                   TAG: ${{ github.event.release.tag_name }}
 
