@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
 import { defined } from "@glideapps/ts-necessities";
-import { SimulationImpl, type SimulationTask } from "./simulation.ts";
+import { NoSimulationTask, noSimulation, SimulationImpl, type SimulationTask } from "./simulation.ts";
 import { RecordingEntropySource, ReplayingEntropySource, SimpleEntropySource } from "./entropy.ts";
 import { isApplicationFailure, isCancellation } from "./errors.ts";
 import { Mutex } from "./mutex.ts";
@@ -788,5 +788,119 @@ describe("deadlines and timeouts", () => {
         assert.deepStrictEqual(await run(), ["cancelled", 3]);
         // And the identical entropy replays to the identical outcome.
         assert.deepStrictEqual(await run(), ["cancelled", 3]);
+    });
+});
+
+describe("noSimulation real time", () => {
+    // Acceptance test 12: the same clock-facing code runs in production
+    // using real time. A shared operation, written once against
+    // SimulationTask, exercised through noSimulation here (and through
+    // SimulationImpl everywhere above).
+    async function backoffOperation(task: SimulationTask): Promise<number> {
+        const start = task.monotonicNow();
+        await task.sleep(10, "first backoff");
+        await task.sleep(15, "second backoff");
+        return task.monotonicNow() - start;
+    }
+
+    it("runs the same sleep-based code with real timers", async () => {
+        const result = await noSimulation.runTasks([{ name: "op", f: backoffOperation }]);
+        assert.ok(result.isOk());
+        // Real timers may fire a hair early or late; the elapsed time must
+        // just be roughly the requested 25ms.
+        assert.ok(defined(result.value[0]) >= 20, `expected >=20ms elapsed, got ${result.value[0]}`);
+    });
+
+    it("wallNow tracks Date.now and monotonicNow advances", async () => {
+        const task = new NoSimulationTask("test", false);
+        assert.ok(Math.abs(task.wallNow() - Date.now()) < 1_000);
+        const before = task.monotonicNow();
+        await task.sleep(10, "tick");
+        assert.ok(task.monotonicNow() > before);
+    });
+
+    // Acceptance test 20 (production half): the same validation as in
+    // simulation — setTimeout would silently clamp a negative delay.
+    it("rejects negative sleep durations", () => {
+        const task = new NoSimulationTask("test", false);
+        assert.throws(() => task.sleep(-5, "bad"), TypeError);
+    });
+
+    it("aborting a real sleep rejects with the abort reason", async () => {
+        const task = new NoSimulationTask("test", false);
+        const reason = new Error("stop");
+        const controller = new AbortController();
+        setTimeout(() => controller.abort(reason), 10);
+        await assert.rejects(
+            task.sleep(60_000, "long", { signal: controller.signal }),
+            (e: unknown) => e === reason,
+        );
+    });
+
+    it("a pre-aborted signal rejects a real sleep immediately", async () => {
+        const task = new NoSimulationTask("test", false);
+        const reason = new Error("already stopped");
+        const controller = new AbortController();
+        controller.abort(reason);
+        const before = Date.now();
+        await assert.rejects(
+            task.sleep(60_000, "long", { signal: controller.signal }),
+            (e: unknown) => e === reason,
+        );
+        assert.ok(Date.now() - before < 1_000);
+    });
+
+    it("an expired real deadline aborts with a cancellation carrying the reason", async () => {
+        const task = new NoSimulationTask("test", false);
+        const deadline = task.createDeadline(10, "real deadline");
+        try {
+            await assert.rejects(
+                task.sleep(60_000, "guarded", { signal: deadline.signal }),
+                (e: unknown) => {
+                    assert.ok(isCancellation(e), `expected a cancellation, got ${String(e)}`);
+                    assert.strictEqual((e as { deadlineReason?: string }).deadlineReason, "real deadline");
+                    return true;
+                },
+            );
+        } finally {
+            deadline.cancel();
+        }
+    });
+
+    it("cancelling a real deadline prevents the abort", async () => {
+        const task = new NoSimulationTask("test", false);
+        const deadline = task.createDeadline(10, "cancelled deadline");
+        deadline.cancel();
+        await task.sleep(30, "wait past the deadline");
+        assert.strictEqual(deadline.signal.aborted, false);
+    });
+
+    it("withTimedSignal cancels its deadline when the operation completes", async () => {
+        const task = new NoSimulationTask("test", false);
+        let signalSeen: AbortSignal | undefined;
+        const value = await task.withTimedSignal(
+            async (signal) => {
+                signalSeen = signal;
+                await task.sleep(5, "quick op", { signal });
+                return "done";
+            },
+            10_000,
+            "generous deadline",
+        );
+        assert.strictEqual(value, "done");
+        await task.sleep(20, "give a leaked timer a chance to fire");
+        assert.strictEqual(defined(signalSeen).aborted, false);
+    });
+
+    it("withTimedSignal aborts a too-slow operation's signal", async () => {
+        const task = new NoSimulationTask("test", false);
+        await assert.rejects(
+            task.withTimedSignal(
+                (signal) => task.sleep(60_000, "too slow", { signal }),
+                10,
+                "tight deadline",
+            ),
+            (e: unknown) => isCancellation(e),
+        );
     });
 });
