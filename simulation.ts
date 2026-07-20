@@ -2,6 +2,7 @@ import { assert, exceptionToError, exceptionToString } from "@glideapps/ts-neces
 import { OwnedAbortSignal } from "./abort-signal.ts";
 import { type EntropySource, sample } from "./entropy.ts";
 import { ApplicationFailure, CancellationError } from "./errors.ts";
+import { isTimerTraceSink, type TimerTraceSink } from "./trace.ts";
 import { err, ok, type Result } from "neverthrow";
 
 export interface Logger {
@@ -304,6 +305,8 @@ export class SimulationImpl implements Simulation {
     private readonly failOnLateCompletion: boolean;
     private readonly maxSchedulingSteps: number | undefined;
     private readonly maxVirtualDurationMs: number | undefined;
+    /** Present iff the entropy source can record/validate timer events (see trace.ts). */
+    private readonly timerTrace: TimerTraceSink | undefined;
     private steps = 0;
     private lastAdvanceStep = 0;
     /**
@@ -326,6 +329,7 @@ export class SimulationImpl implements Simulation {
         this.failOnLateCompletion = options.failOnLateCompletion ?? false;
         this.maxSchedulingSteps = options.maxSchedulingSteps;
         this.maxVirtualDurationMs = options.maxVirtualDurationMs;
+        this.timerTrace = isTimerTraceSink(entropy) ? entropy : undefined;
     }
 
     private countStep(): void {
@@ -413,7 +417,22 @@ export class SimulationImpl implements Simulation {
         const id = this.nextTimerId++;
         this.timers.set(id, { id, reason, deadline, fire });
         this.logger.log(`TIMER '${reason}' created at t=${this.monotonic}ms with deadline t=${deadline}ms`);
+        this.timerTrace?.timerCreated(id, reason, deadline);
         return id;
+    }
+
+    /**
+     * Cancels a pending timer as a semantic event (sleep abort, deadline
+     * cancel) that is recorded in the trace. No-op if the timer already
+     * fired or was cancelled. NOT for exception-path rollback — a rolled-back
+     * timer registration is undone bookkeeping, not a replayable event.
+     */
+    private cancelTimer(id: number, why: string): void {
+        const timer = this.timers.get(id);
+        if (timer === undefined) return;
+        this.timers.delete(id);
+        this.logger.log(`TIMER '${timer.reason}' cancelled (${why}) at t=${this.monotonic}ms`);
+        this.timerTrace?.timerCancelled(id, timer.reason);
     }
 
     /**
@@ -440,6 +459,7 @@ export class SimulationImpl implements Simulation {
             this.lastAdvanceStep = this.steps;
         }
         this.logger.log(`TIMER '${timer.reason}' fired at t=${this.monotonic}ms (deadline t=${timer.deadline}ms)`);
+        this.timerTrace?.timerFired(timer.id, timer.reason, this.monotonic);
         timer.fire();
     }
 
@@ -614,24 +634,47 @@ export class SimulationImpl implements Simulation {
                     simulation.logger.log(
                         `${s.name} SLEEP '${reason}' at t=${simulation.monotonic}ms for ${durationMs}ms until t=${deadline}ms`,
                     );
+                    let resolveSleep!: () => void;
+                    let rejectSleep!: (e: unknown) => void;
+                    const promise = new Promise<void>((resolve, reject) => {
+                        resolveSleep = resolve;
+                        rejectSleep = reject;
+                    });
+                    assert(info.resolve === undefined, `Task ${s.name} already has a resolve`);
+                    // The task sleeps in its single park slot: blocked like
+                    // a blockpoint, woken by exactly one of two events — its
+                    // timer firing, or its signal aborting. Each event flips
+                    // the slot to a schedulable continuation and disarms the
+                    // other, so the task can never be woken twice.
+                    info.resolve = false;
+                    info.parkReason = `sleeping '${reason}' until t=${deadline}ms`;
                     let timerId: number | undefined;
                     let detachAbort: (() => void) | undefined;
-                    const promise = new Promise<void>((resolve, reject) => {
-                        assert(info.resolve === undefined, `Task ${s.name} already has a resolve`);
-                        // The task sleeps in its single park slot: blocked
-                        // like a blockpoint, woken by exactly one of two
-                        // events — its timer firing, or its signal aborting.
-                        // Each event flips the slot to a schedulable
-                        // continuation and disarms the other, so the task
-                        // can never be woken twice.
-                        info.resolve = false;
-                        info.parkReason = `sleeping '${reason}' until t=${deadline}ms`;
+                    const rollBackPark = (): void => {
+                        // The task is NOT sleeping — it is running its error
+                        // path. The park slot, the just-registered timer,
+                        // and the abort hook must all be rolled back,
+                        // otherwise either could later ghost-wake a task
+                        // that isn't parked. (The pending sleep promise is
+                        // abandoned unsettled, like an abandoned checkpoint
+                        // promise.)
+                        info.resolve = undefined;
+                        info.parkReason = undefined;
+                        if (timerId !== undefined) simulation.timers.delete(timerId);
+                        detachAbort?.();
+                    };
+                    try {
+                        // Outside the promise executor: a trace-divergence
+                        // throw from timer registration must propagate
+                        // synchronously out of sleep, not reject a promise
+                        // nobody will await.
                         timerId = simulation.registerTimer(`${s.name} sleep: ${reason}`, deadline, () => {
                             detachAbort?.();
                             info.parkReason = undefined;
-                            info.resolve = resolve;
+                            info.resolve = resolveSleep;
                         });
                         if (signal !== undefined) {
+                            const registeredTimerId = timerId;
                             const onAbort = (): void => {
                                 // Dispatches synchronously in whatever stack
                                 // aborts the signal — an aborting task, or
@@ -639,13 +682,9 @@ export class SimulationImpl implements Simulation {
                                 // deadline expires. The sleeper merely
                                 // becomes schedulable; the entropy scheduler
                                 // picks up the aborted sleeper later.
-                                assert(timerId !== undefined, "Abort hook ran before the sleep timer was registered");
-                                simulation.timers.delete(timerId);
-                                simulation.logger.log(
-                                    `TIMER '${s.name} sleep: ${reason}' cancelled by abort at t=${simulation.monotonic}ms`,
-                                );
+                                simulation.cancelTimer(registeredTimerId, "sleep aborted");
                                 info.parkReason = undefined;
-                                info.resolve = () => reject(signal.reason);
+                                info.resolve = () => rejectSleep(signal.reason);
                             };
                             if (signal instanceof OwnedAbortSignal) {
                                 // On a determined-owned signal the sleep
@@ -660,17 +699,11 @@ export class SimulationImpl implements Simulation {
                                 detachAbort = () => signal.removeEventListener("abort", onAbort);
                             }
                         }
-                    });
-                    // Exception safety: a synchronous throw out of the
-                    // scheduling that follows the park (entropy guard, abort)
-                    // means the task is NOT sleeping — it is running its
-                    // error path. The park slot, the just-registered timer,
-                    // and the abort hook must all be rolled back, otherwise
-                    // either could later ghost-wake a task that isn't parked.
-                    simulation.unlockIfNecessaryAfterPark(info, () => {
-                        if (timerId !== undefined) simulation.timers.delete(timerId);
-                        detachAbort?.();
-                    });
+                        simulation.unlockIfNecessary();
+                    } catch (e) {
+                        rollBackPark();
+                        throw e;
+                    }
                     return promise;
                 },
                 createDeadline(durationMs: number, reason: string): Deadline {
@@ -701,11 +734,7 @@ export class SimulationImpl implements Simulation {
                         signal: signal as unknown as AbortSignal,
                         cancel: () => {
                             simulation.activeDeadlines.delete(active);
-                            if (simulation.timers.delete(timerId)) {
-                                simulation.logger.log(
-                                    `TIMER '${timerReason}' cancelled at t=${simulation.monotonic}ms`,
-                                );
-                            }
+                            simulation.cancelTimer(timerId, "deadline cancelled");
                         },
                     };
                 },
@@ -750,6 +779,9 @@ export class SimulationImpl implements Simulation {
         }
 
         try {
+            // In the try so that a replay divergence on the recorded epoch
+            // fails the run like any other divergence.
+            this.timerTrace?.runStart(this.wallClockEpoch);
             const results = (await Promise.all(
                 tasksAndInfos.map(([s, task]) => {
                     return task
