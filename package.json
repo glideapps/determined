@@ -33,11 +33,11 @@
     },
     "devDependencies": {
         "@types/node": "^26.1.1",
-        "tsup": "^8.5.1",
-        "typescript": "^5.9.3"
+        "tsdown": "^0.22.12",
+        "typescript": "^7.0.2"
     },
     "scripts": {
-        "build": "tsup",
+        "build": "tsdown",
         "test": "node --experimental-strip-types --test *.test.ts",
         "typecheck": "tsc",
         "prepublishOnly": "npm run build"
