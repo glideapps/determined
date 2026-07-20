@@ -978,3 +978,122 @@ describe("safety guards", () => {
         assert.match(result.error.message, /too far/);
     });
 });
+
+describe("timer pick policy", () => {
+    it("a custom policy chooses which pending timer fires", async () => {
+        // An earliest-deadline-first policy: fully deterministic, consumes
+        // no entropy. Unbiased picking could make time gallop; the policy
+        // shapes exploration only.
+        const sim = new SimulationImpl(
+            new ArrayLogger(),
+            new FixedEntropySource([0]),
+            () => 0,
+            {
+                pickTimerIndex: (timers) => {
+                    let best = 0;
+                    for (let i = 1; i < timers.length; i++) {
+                        if (defined(timers[i]).deadline < defined(timers[best]).deadline) best = i;
+                    }
+                    return best;
+                },
+            },
+        );
+        const wakes: Array<[string, number]> = [];
+        // Entropy: only the START pick (0 -> A). Both timer picks go through
+        // the policy, which draws nothing.
+        const result = await sim.runTasks([
+            {
+                name: "A",
+                f: async (task: SimulationTask) => {
+                    await task.sleep(2_000, "late");
+                    wakes.push(["A", task.monotonicNow()]);
+                },
+            },
+            {
+                name: "B",
+                f: async (task: SimulationTask) => {
+                    await task.sleep(1_000, "early");
+                    wakes.push(["B", task.monotonicNow()]);
+                },
+            },
+        ]);
+        assert.ok(result.isOk(), `expected ok, got err: ${result.isErr() ? result.error.message : ""}`);
+        // Earliest-first: B wakes at 1000 before A at 2000 — unlike the
+        // default uniform pick, this is guaranteed regardless of entropy.
+        assert.deepStrictEqual(wakes, [
+            ["B", 1_000],
+            ["A", 2_000],
+        ]);
+    });
+
+    it("a policy can consume entropy to bias the choice", async () => {
+        async function run(draw: number): Promise<Array<[string, number]>> {
+            const wakes: Array<[string, number]> = [];
+            const sim = new SimulationImpl(
+                new ArrayLogger(),
+                new FixedEntropySource([0, draw]),
+                () => 0,
+                {
+                    // Fire the earliest deadline with 90% probability, any
+                    // other uniformly otherwise — a biased exploration
+                    // policy in the spirit of the spec's suggestion.
+                    pickTimerIndex: (timers, _now, random) => {
+                        const r = random("timer pick bias");
+                        let earliest = 0;
+                        for (let i = 1; i < timers.length; i++) {
+                            if (defined(timers[i]).deadline < defined(timers[earliest]).deadline) earliest = i;
+                        }
+                        if (r < 0.9) return earliest;
+                        return earliest === 0 ? 1 : 0;
+                    },
+                },
+            );
+            const result = await sim.runTasks([
+                {
+                    name: "A",
+                    f: async (task: SimulationTask) => {
+                        await task.sleep(2_000, "late");
+                        wakes.push(["A", task.monotonicNow()]);
+                    },
+                },
+                {
+                    name: "B",
+                    f: async (task: SimulationTask) => {
+                        await task.sleep(1_000, "early");
+                        wakes.push(["B", task.monotonicNow()]);
+                    },
+                },
+            ]);
+            assert.ok(result.isOk(), `expected ok, got err: ${result.isErr() ? result.error.message : ""}`);
+            return wakes;
+        }
+
+        assert.deepStrictEqual(await run(0.5), [
+            ["B", 1_000],
+            ["A", 2_000],
+        ]);
+        assert.deepStrictEqual(await run(0.95), [
+            ["A", 2_000],
+            ["B", 2_000],
+        ]);
+    });
+
+    it("a single pending timer is a forced choice that bypasses the policy", async () => {
+        const sim = new SimulationImpl(new ArrayLogger(), new FixedEntropySource([]), () => 0, {
+            pickTimerIndex: () => {
+                throw new Error("policy must not be called for a forced choice");
+            },
+        });
+        const result = await sim.runTasks([
+            {
+                name: "A",
+                f: async (task: SimulationTask) => {
+                    await task.sleep(1_000, "solo");
+                    return task.monotonicNow();
+                },
+            },
+        ]);
+        assert.ok(result.isOk(), `expected ok, got err: ${result.isErr() ? result.error.message : ""}`);
+        assert.deepStrictEqual(result.value, [1_000]);
+    });
+});

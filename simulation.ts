@@ -87,6 +87,29 @@ export interface SimulationOptions {
     readonly maxSchedulingSteps?: number;
     /** Aborts the simulation when a timer firing would advance the virtual clock past this. */
     readonly maxVirtualDurationMs?: number;
+    /**
+     * Policy for choosing which pending timer fires next. Receives the
+     * pending timers (in creation order), the current virtual time, and a
+     * random source drawing from the simulation's entropy; returns the
+     * index of the timer to fire. Unbiased picking can make time gallop —
+     * choosing a pending 24-hour retention timer over a 100ms heartbeat
+     * jumps the clock a day — so a policy biased toward earlier deadlines
+     * is often a better default search strategy. The policy shapes
+     * exploration only; replay replays the recorded entropy and timer
+     * records. Never called when only one timer is pending: that is a
+     * forced choice, which also consumes no entropy. Defaults to a uniform
+     * entropy pick.
+     */
+    readonly pickTimerIndex?: (
+        timers: readonly PendingTimerView[],
+        now: number,
+        random: (reason: string) => number,
+    ) => number;
+}
+
+export interface PendingTimerView {
+    readonly reason: string;
+    readonly deadline: number;
 }
 
 function validateSleepDuration(durationMs: number, reason: string): void {
@@ -307,6 +330,7 @@ export class SimulationImpl implements Simulation {
     private readonly maxVirtualDurationMs: number | undefined;
     /** Present iff the entropy source can record/validate timer events (see trace.ts). */
     private readonly timerTrace: TimerTraceSink | undefined;
+    private readonly pickTimerIndex: SimulationOptions["pickTimerIndex"];
     private steps = 0;
     private lastAdvanceStep = 0;
     /**
@@ -330,6 +354,7 @@ export class SimulationImpl implements Simulation {
         this.maxSchedulingSteps = options.maxSchedulingSteps;
         this.maxVirtualDurationMs = options.maxVirtualDurationMs;
         this.timerTrace = isTimerTraceSink(entropy) ? entropy : undefined;
+        this.pickTimerIndex = options.pickTimerIndex;
     }
 
     private countStep(): void {
@@ -444,7 +469,20 @@ export class SimulationImpl implements Simulation {
     private fireNextTimer(): void {
         this.countStep();
         const timers = Array.from(this.timers.values());
-        const timer = sample(this.entropy, `Picking timer out of ${timers.map((t) => t.reason).join(", ")}`, timers);
+        let timer: PendingTimer | undefined;
+        if (this.pickTimerIndex === undefined || timers.length < 2) {
+            // A single pending timer is a forced choice: no policy, no
+            // entropy (consistent with sample()).
+            timer = sample(this.entropy, `Picking timer out of ${timers.map((t) => t.reason).join(", ")}`, timers);
+        } else {
+            const index = this.pickTimerIndex(
+                timers.map((t) => ({ reason: t.reason, deadline: t.deadline })),
+                this.monotonic,
+                (reason) => this.entropy.random(reason),
+            );
+            timer = timers[index];
+            assert(timer !== undefined, `pickTimerIndex returned invalid index ${index} for ${timers.length} timers`);
+        }
         assert(timer !== undefined, "No timers to pick from");
         const newNow = Math.max(this.monotonic, timer.deadline);
         if (this.maxVirtualDurationMs !== undefined && newNow > this.maxVirtualDurationMs) {
