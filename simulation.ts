@@ -1,6 +1,7 @@
 import { assert, exceptionToError, exceptionToString } from "@glideapps/ts-necessities";
+import { OwnedAbortSignal } from "./abort-signal.ts";
 import { type EntropySource, sample } from "./entropy.ts";
-import { ApplicationFailure } from "./errors.ts";
+import { ApplicationFailure, CancellationError } from "./errors.ts";
 import { err, ok, type Result } from "neverthrow";
 
 export interface Logger {
@@ -31,6 +32,23 @@ export interface SimulationTask extends Logger, EntropySource {
      * entropy.
      */
     sleep(durationMs: number, reason: string, options?: SleepOptions): Promise<void>;
+    /**
+     * Creates a deadline that aborts its signal `durationMs` from now. The
+     * signal aborts when the deadline's timer FIRES, which — like any timer —
+     * may be later than the nominal deadline. `cancel()` removes the pending
+     * timer (idempotent, and a no-op after the signal aborted); callers must
+     * cancel when the guarded work completes, or the timer keeps the
+     * simulation alive and the deadline eventually fires.
+     */
+    createDeadline(durationMs: number, reason: string): Deadline;
+    /**
+     * Runs `f` with a signal that aborts after `durationMs`, and cancels the
+     * deadline when `f` settles. Does NOT force-interrupt `f`: cancellation
+     * is cooperative, and every operation inside `f` that can block must
+     * accept and honor the signal. In return: when this returns, no work
+     * started under it is still running.
+     */
+    withTimedSignal<T>(f: (signal: AbortSignal) => Promise<T>, durationMs: number, reason: string): Promise<T>;
 
     abortSimulation(e: unknown): never;
 }
@@ -39,12 +57,24 @@ export interface SleepOptions {
     readonly signal?: AbortSignal;
 }
 
+export interface Deadline {
+    readonly signal: AbortSignal;
+    cancel(): void;
+}
+
 export interface SimulationOptions {
     /**
      * The wall-clock time at virtual monotonic time 0, in milliseconds since
      * the Unix epoch. Defaults to 0.
      */
     readonly wallClockEpoch?: number;
+    /**
+     * When work under a `withTimedSignal` completes after its signal
+     * aborted, the simulation reports it — this almost always means some
+     * operation ignored its signal. By default the report is a warning
+     * logged via the logger; setting this aborts the simulation instead.
+     */
+    readonly failOnLateCompletion?: boolean;
 }
 
 function validateSleepDuration(durationMs: number, reason: string): void {
@@ -139,6 +169,37 @@ export class NoSimulationTask implements SimulationTask {
         });
     }
 
+    public createDeadline(durationMs: number, reason: string): Deadline {
+        validateSleepDuration(durationMs, reason);
+        const controller = new AbortController();
+        const timer = setTimeout(() => {
+            controller.abort(
+                new CancellationError(
+                    `Deadline '${reason}' aborted after ${durationMs}ms`,
+                    reason,
+                    performance.now(),
+                ),
+            );
+        }, durationMs);
+        return {
+            signal: controller.signal,
+            cancel: () => clearTimeout(timer),
+        };
+    }
+
+    public async withTimedSignal<T>(
+        f: (signal: AbortSignal) => Promise<T>,
+        durationMs: number,
+        reason: string,
+    ): Promise<T> {
+        const deadline = this.createDeadline(durationMs, reason);
+        try {
+            return await f(deadline.signal);
+        } finally {
+            deadline.cancel();
+        }
+    }
+
     public abortSimulation(e: unknown): never {
         throw exceptionToError(e);
     }
@@ -208,6 +269,14 @@ interface PendingTimer {
     readonly fire: () => void;
 }
 
+interface ActiveDeadline {
+    readonly reason: string;
+    /** The task that created the deadline. The signal may since have been passed elsewhere. */
+    readonly owner: string;
+    readonly deadline: number;
+    readonly signal: OwnedAbortSignal;
+}
+
 export class SimulationImpl implements Simulation {
     private readonly logger: Logger;
     private readonly entropy: EntropySource;
@@ -220,6 +289,14 @@ export class SimulationImpl implements Simulation {
     private monotonic = 0;
     private readonly timers = new Map<number, PendingTimer>();
     private nextTimerId = 1;
+    private readonly activeDeadlines = new Set<ActiveDeadline>();
+    private readonly failOnLateCompletion: boolean;
+    /**
+     * Set while a user 'abort' listener is dispatching. Task APIs called
+     * from listener context corrupt scheduler bookkeeping or entropy-stream
+     * stability, so they fail descriptively instead.
+     */
+    private inUserAbortListener = false;
 
     constructor(
         logger: Logger,
@@ -231,6 +308,30 @@ export class SimulationImpl implements Simulation {
         this.entropy = entropy;
         this.failpointFailureProbability = failpointFailureProbability;
         this.wallClockEpoch = options.wallClockEpoch ?? 0;
+        this.failOnLateCompletion = options.failOnLateCompletion ?? false;
+    }
+
+    private assertNotInAbortListener(what: string): void {
+        if (this.inUserAbortListener) {
+            throw new Error(
+                `Task API '${what}' called from within a user 'abort' listener. ` +
+                    "Abort listeners must be plain synchronous state changes — they must not " +
+                    "call task APIs, operate blocking primitives, or consume entropy.",
+            );
+        }
+    }
+
+    private dispatchUserAbortListener(listener: () => void): void {
+        this.inUserAbortListener = true;
+        try {
+            listener();
+        } catch (e) {
+            // The platform's report-and-continue dispatch behavior would hide
+            // bugs; a throwing listener aborts the simulation instead.
+            this.abort(e);
+        } finally {
+            this.inUserAbortListener = false;
+        }
     }
 
     private abort(e: unknown): never {
@@ -298,9 +399,19 @@ export class SimulationImpl implements Simulation {
         const blocked = infos
             .map((i) => `${i.name}${i.parkReason !== undefined ? ` (${i.parkReason})` : ""}`)
             .join(", ");
-        return new Error(
-            `Deadlock at t=${this.monotonic}ms: all tasks are blocked and no timers are pending. Blocked tasks: ${blocked}`,
-        );
+        let message = `Deadlock at t=${this.monotonic}ms: all tasks are blocked and no timers are pending. Blocked tasks: ${blocked}.`;
+        // A blocked task holding an already-aborted signal is the typical
+        // signature of a deadline that could not interrupt a non-cancellable
+        // wait — calling it out turns a confusing deadlock into a
+        // self-explaining one.
+        const aborted = Array.from(this.activeDeadlines).filter((d) => d.signal.aborted);
+        if (aborted.length > 0) {
+            const signals = aborted
+                .map((d) => `'${d.reason}' (created by ${d.owner}, aborted at t=${d.signal.abortedAtMs}ms)`)
+                .join(", ");
+            message += ` Aborted signals still held: ${signals}.`;
+        }
+        return new Error(message);
     }
 
     private unlockIfNecessary(): void {
@@ -353,11 +464,13 @@ export class SimulationImpl implements Simulation {
         this.monotonic = 0;
         this.timers.clear();
         this.nextTimerId = 1;
+        this.activeDeadlines.clear();
 
         const tasksAndInfos = specs.map((s) => {
             const info: TaskInfo = { name: s.name, resolve: undefined, parkReason: undefined };
             const task: SimulationTask = {
                 random(name: string): number {
+                    simulation.assertNotInAbortListener("random");
                     const r = simulation.entropy.random(`${s.name} random number: ${name}`);
                     simulation.logger.log(`${s.name} RANDOM ${name}: ${r}`);
                     return r;
@@ -369,6 +482,7 @@ export class SimulationImpl implements Simulation {
                     simulation.logger.error(`${s.name}:`, ...log);
                 },
                 checkpoint(...log: readonly unknown[]): Promise<void> {
+                    simulation.assertNotInAbortListener("checkpoint");
                     simulation.logger.log(`${s.name} CHECKPOINT:`, ...log);
                     assert(
                         simulation.taskInfos.has(task),
@@ -383,6 +497,7 @@ export class SimulationImpl implements Simulation {
                     return promise;
                 },
                 failpoint(...log: readonly unknown[]): Promise<void> {
+                    simulation.assertNotInAbortListener("failpoint");
                     assert(
                         simulation.taskInfos.has(task),
                         `Task ${s.name} wants to failpoint, but doesn't exist anymore`,
@@ -416,6 +531,7 @@ export class SimulationImpl implements Simulation {
                     return promise;
                 },
                 blockpoint(...log: readonly unknown[]): void {
+                    simulation.assertNotInAbortListener("blockpoint");
                     simulation.logger.log(`${s.name} BLOCKPOINT:`, ...log);
                     assert(simulation.taskInfos.has(task));
                     assert(info.resolve === undefined, `Task ${s.name} already has a resolve`);
@@ -430,6 +546,7 @@ export class SimulationImpl implements Simulation {
                     return simulation.wallClockEpoch + simulation.monotonic;
                 },
                 sleep(durationMs: number, reason: string, options?: SleepOptions): Promise<void> {
+                    simulation.assertNotInAbortListener("sleep");
                     validateSleepDuration(durationMs, reason);
                     assert(simulation.taskInfos.has(task), `Task ${s.name} wants to sleep, but doesn't exist anymore`);
                     const signal = options?.signal;
@@ -465,11 +582,12 @@ export class SimulationImpl implements Simulation {
                         });
                         if (signal !== undefined) {
                             const onAbort = (): void => {
-                                // Dispatches synchronously in the aborter's
-                                // stack. The sleeper merely becomes
-                                // schedulable — the aborter continues until
-                                // it parks, and the entropy scheduler picks
-                                // up the aborted sleeper later.
+                                // Dispatches synchronously in whatever stack
+                                // aborts the signal — an aborting task, or
+                                // the scheduler's clock-advance step when a
+                                // deadline expires. The sleeper merely
+                                // becomes schedulable; the entropy scheduler
+                                // picks up the aborted sleeper later.
                                 assert(timerId !== undefined, "Abort hook ran before the sleep timer was registered");
                                 simulation.timers.delete(timerId);
                                 simulation.logger.log(
@@ -478,8 +596,18 @@ export class SimulationImpl implements Simulation {
                                 info.parkReason = undefined;
                                 info.resolve = () => reject(signal.reason);
                             };
-                            signal.addEventListener("abort", onAbort, { once: true });
-                            detachAbort = () => signal.removeEventListener("abort", onAbort);
+                            if (signal instanceof OwnedAbortSignal) {
+                                // On a determined-owned signal the sleep
+                                // wakeup is privileged: it runs before any
+                                // user listener and outside the safety
+                                // guard, so the cancelled sleeper is already
+                                // settled by the time user code observes the
+                                // abort.
+                                detachAbort = signal.addInternalCallback(onAbort);
+                            } else {
+                                signal.addEventListener("abort", onAbort, { once: true });
+                                detachAbort = () => signal.removeEventListener("abort", onAbort);
+                            }
                         }
                     });
                     // Exception safety: a synchronous throw out of the
@@ -493,6 +621,70 @@ export class SimulationImpl implements Simulation {
                         detachAbort?.();
                     });
                     return promise;
+                },
+                createDeadline(durationMs: number, reason: string): Deadline {
+                    simulation.assertNotInAbortListener("createDeadline");
+                    validateSleepDuration(durationMs, reason);
+                    assert(
+                        simulation.taskInfos.has(task),
+                        `Task ${s.name} wants to create a deadline, but doesn't exist anymore`,
+                    );
+                    const signal = new OwnedAbortSignal({
+                        dispatchUserAbortListener: (listener) => simulation.dispatchUserAbortListener(listener),
+                    });
+                    const deadline = simulation.monotonic + durationMs;
+                    const timerReason = `${s.name} deadline: ${reason}`;
+                    const active: ActiveDeadline = { reason, owner: s.name, deadline, signal };
+                    const timerId = simulation.registerTimer(timerReason, deadline, () => {
+                        // The signal aborts when its timer fires, which may
+                        // be later than the nominal deadline — aborts are
+                        // events, not clock state.
+                        const now = simulation.monotonic;
+                        signal.abort(
+                            new CancellationError(`Deadline '${reason}' aborted at t=${now}ms`, reason, now),
+                            now,
+                        );
+                    });
+                    simulation.activeDeadlines.add(active);
+                    return {
+                        signal: signal as unknown as AbortSignal,
+                        cancel: () => {
+                            simulation.activeDeadlines.delete(active);
+                            if (simulation.timers.delete(timerId)) {
+                                simulation.logger.log(
+                                    `TIMER '${timerReason}' cancelled at t=${simulation.monotonic}ms`,
+                                );
+                            }
+                        },
+                    };
+                },
+                async withTimedSignal<T>(
+                    f: (signal: AbortSignal) => Promise<T>,
+                    durationMs: number,
+                    reason: string,
+                ): Promise<T> {
+                    const deadline = task.createDeadline(durationMs, reason);
+                    try {
+                        return await f(deadline.signal);
+                    } finally {
+                        deadline.cancel();
+                        const owned = deadline.signal as unknown as OwnedAbortSignal;
+                        const abortedAt = owned.abortedAtMs;
+                        // Work settling AFTER the abort instant almost always
+                        // means some operation ignored its signal — an
+                        // honored cancellation settles at the abort instant
+                        // itself. Free and deterministic under virtual time.
+                        if (abortedAt !== undefined && simulation.monotonic > abortedAt) {
+                            const message =
+                                `operation under '${reason}' (${durationMs}ms) completed at ` +
+                                `t=${simulation.monotonic}ms, ${simulation.monotonic - abortedAt}ms after its signal aborted`;
+                            if (simulation.failOnLateCompletion) {
+                                simulation.abort(new Error(message));
+                            } else {
+                                simulation.logger.error(`WARNING: ${message}`);
+                            }
+                        }
+                    }
                 },
                 abortSimulation(e): never {
                     return simulation.abort(e);
