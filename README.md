@@ -41,6 +41,9 @@ The interface every task function receives. It extends `Logger` and `EntropySour
 - **`blockpoint(...log)`** — Marks the task as blocked (waiting on an external condition like a mutex or condition variable). Unlike checkpoint, blocked tasks are excluded from scheduling until something unblocks them. If all tasks are blocked, the simulation detects deadlock.
 - **`abortSimulation(error)`** — Immediately aborts the entire simulation run with the given error.
 - **`random(reason)`** — Returns a random number in [0, 1) from the simulation's entropy source.
+- **`monotonicNow()`** / **`wallNow()`** — The current monotonic and wall-clock time in milliseconds. Virtual in simulation (wall time is a configurable epoch plus monotonic time), real in production.
+- **`sleep(durationMs, reason, { signal? })`** — Blocks until virtual time reaches at least `now + durationMs`; cancellable via an `AbortSignal` (see "Deterministic time" below).
+- **`createDeadline(durationMs, reason)`** / **`withTimedSignal(f, durationMs, reason)`** — Deadline handles and scoped timeouts (see "Deterministic time" below).
 - **`log(...)`** / **`error(...)`** — Logging, routed through the simulation's logger.
 
 #### `SimulationImpl`
@@ -52,8 +55,17 @@ new SimulationImpl(
     logger: Logger,
     entropy: EntropySource,
     failpointFailureProbability: (...log: readonly unknown[]) => number,
+    options?: SimulationOptions,
 )
 ```
+
+`SimulationOptions`:
+
+- **`wallClockEpoch`** — Wall-clock time at virtual monotonic time 0 (default 0).
+- **`maxSchedulingSteps`** — Aborts runs that make more scheduling decisions than this. The failure reports whether virtual time was still advancing — a budget exhausted at a fixed virtual time is the signature of a zero-duration-timer or checkpoint livelock.
+- **`maxVirtualDurationMs`** — Aborts runs whose virtual clock would advance past this.
+- **`failOnLateCompletion`** — Escalates the ignored-signal diagnostic (work under a `withTimedSignal` completing after its signal aborted) from a warning to a failure.
+- **`pickTimerIndex`** — Timer firing policy; see "Deterministic time".
 
 Call `runTasks(specs)` with an array of `TaskSpec` objects. Each spec has a `name` and an async function `f` that receives a `SimulationTask`. All tasks start at an implicit `checkpoint("START")`, and the scheduler picks which one runs first.
 
@@ -63,9 +75,44 @@ Returns `Result<T[], Error>` — either the array of results (in spec order) or 
 
 **Scheduling algorithm**: When all running tasks have reached a checkpoint or blockpoint, the scheduler picks one of the checkpointed tasks using `sample()` (entropy-driven). Blocked tasks are excluded. If no tasks are checkpointed and all are blocked, a deadlock error is raised.
 
+#### Deterministic time
+
+The simulation has a virtual monotonic clock, starting at 0 per run. Time never passes for real: `task.sleep(3_600_000, "one hour")` completes instantly in real time.
+
+**Timer deadlines are lower bounds.** A 1,000ms timer may fire at any virtual time at or after 1,000ms — exactly the real contract of `setTimeout`, where event-loop lag or a suspended process can delay any timer. When no task is runnable, an entropy-chosen pending timer — *any* of them — fires, and the clock advances to `max(now, deadline)`. A 2,000ms timer can therefore fire before a 1,000ms timer; code must not depend on relative firing order. Firing order is recorded and replayed like every other entropy decision, and a single pending timer is a forced choice that consumes no entropy.
+
+Because unbiased picking can make time gallop (choosing a pending 24-hour retention timer over a 100ms heartbeat jumps the clock a day), the pick distribution is a configurable policy via `options.pickTimerIndex` — e.g. biased strongly toward the earliest deadline. The policy shapes exploration only; replay is unaffected.
+
+**Cancellation is cooperative.** A sleep given a `signal` rejects with `signal.reason` when the signal aborts (the same contract as Node's cancellable `setTimeout` from `timers/promises`); the pending timer is removed, and a sleep given an already-aborted signal rejects immediately without registering a timer or consuming entropy. Nothing else is interruptible: a task blocked on a mutex or condition variable does not observe a deadline until it unblocks.
+
+```typescript
+// Preferred: a scoped timeout owning both timer and cancellation lifecycle.
+const value = await task.withTimedSignal(
+    (signal) => operation(signal),   // operation must honor the signal
+    10_000,
+    "runtime request deadline",
+);
+
+// Lower-level: a cancellable deadline handle.
+const deadline = task.createDeadline(10_000, "runtime health timeout");
+try {
+    await operation(deadline.signal);
+} finally {
+    deadline.cancel();
+}
+```
+
+`withTimedSignal` never force-interrupts its callback: it returns only when the callback returns, so when it returns, no work started under it is still running. A callback that ignores its signal completes late — and the simulation reports it ("completed N ms after its signal aborted"), as a warning by default or a failure with `failOnLateCompletion`.
+
+A deadline's signal aborts when its timer *fires*, which may be later than the nominal deadline — aborts are events, not clock state. The abort reason is a `CancellationError` carrying the deadline's reason and the virtual abort time. Distinguish cancellations from simulated failures with `isCancellation(e)`: retry loops retry `ApplicationFailure`s but must always propagate cancellations.
+
+`'abort'` listeners dispatch synchronously in whatever stack aborts the signal. User listeners must be plain synchronous state changes: calling task APIs from a listener fails with a descriptive error, and a listener that throws aborts the simulation. (Internally, sleep wakeups on a deadline signal are privileged callbacks that run before any user listener.) In simulation the deadline signal is a `determined`-owned implementation of the `AbortSignal` interface — rely only on standard signal behavior: no `instanceof AbortSignal`, and don't hand it to native APIs.
+
+Sleeping tasks count as blocked with a pending timer, so they never trigger false deadlock detection; a deadlock report includes each blocked task's park reason and calls out aborted-but-uncancelled deadline signals — the signature of a deadline that could not interrupt a non-cancellable wait.
+
 #### `NoSimulationTask` / `noSimulation`
 
-Production-mode implementations where `checkpoint()` and `failpoint()` resolve immediately, `blockpoint()` is a no-op, and `random()` uses `Math.random()`. The `noSimulation` singleton runs all tasks concurrently via `Promise.all`.
+Production-mode implementations where `checkpoint()` and `failpoint()` resolve immediately, `blockpoint()` is a no-op, and `random()` uses `Math.random()`. The clock-facing API uses real time: `performance.now()`/`Date.now()`, real cancellable timers for `sleep`, and `AbortController`-backed deadlines that abort with the same `CancellationError` shape — business logic needs no `if (simulation)` branches. Negative sleep durations throw a `TypeError` in both modes (real `setTimeout` would silently clamp them). The `noSimulation` singleton runs all tasks concurrently via `Promise.all`.
 
 ### entropy.ts
 
@@ -91,6 +138,15 @@ The `reason` parameter is a human-readable label used for recording and replay d
 
 Picks a random element from an array using the entropy source. Returns `undefined` for empty arrays. For single-element arrays, returns the element without consuming entropy (important for replay: avoids spurious entropy consumption when the choice is forced).
 
+### trace.ts
+
+The preferred record/replay mechanism for time-capable simulations. Entropy-only traces cannot detect timer divergence in general: forced choices consume no entropy, so a run with a single pending timer leaves no entropy footprint in which a changed reason or deadline could be noticed. The trace is a typed sequence of records — the run's wall-clock epoch, entropy draws, and explicit timer creation/cancellation/firing events — validated in order during replay.
+
+- **`RecordingTraceSource`** — Wraps an entropy source and records the full trace; `getTrace()` returns it.
+- **`ReplayingTraceSource`** — Replays a trace, throwing descriptive divergence errors (position, recorded vs. actual) on any mismatch; `assertFullyConsumed()` catches runs that did less than the recording.
+
+`SimulationImpl` feeds timer events to its entropy source whenever the source implements `TimerTraceSink`, so plain entropy sources keep working — they just can't validate timer behavior.
+
 ### errors.ts
 
 #### `ApplicationFailure`
@@ -105,6 +161,10 @@ Used by failpoints to distinguish simulated failures from real bugs.
 #### `isApplicationFailure(error)`
 
 Type guard for `ApplicationFailure`.
+
+#### `CancellationError` / `isCancellation(error)`
+
+The rejection used when a sleep is aborted or a deadline expires; carries the deadline's reason string and the (virtual) abort time. Deliberately not an `ApplicationFailure`: retry logic retries application failures but must always propagate cancellations — a retry loop that swallows an abort defeats the shutdown that requested it. `isCancellation` also recognizes the platform's `DOMException` `AbortError`/`TimeoutError`, so the predicate works in production.
 
 ### mutex.ts
 
@@ -296,11 +356,13 @@ for (let i = 0; i < 1000; i++) {
 
 The typical workflow:
 
-1. **Run with recording**: Use `RecordingEntropySource` wrapping a `SimpleEntropySource`.
-2. **On failure**: Save `recording.getRecords()` to a JSON file.
-3. **Replay**: Load the records and pass them to `ReplayingEntropySource`. The simulation will make the exact same scheduling decisions, hit the exact same failpoints, and reproduce the failure.
+1. **Run with recording**: Use `RecordingTraceSource` wrapping a `SimpleEntropySource`.
+2. **On failure**: Save `recording.getTrace()` to a JSON file.
+3. **Replay**: Load the trace and pass it to `ReplayingTraceSource`. The simulation will make the exact same scheduling decisions, hit the exact same failpoints, fire the exact same timers, and reproduce the failure.
 
-The `ReplayingEntropySource` validates that each entropy request matches the recorded name. A mismatch means the code has changed in a way that alters the entropy consumption pattern, and it throws a descriptive error with position and both names.
+The replaying source validates every entropy request and timer event against the recording. A mismatch means the code has changed in a way that alters the run, and it throws a descriptive error with the position and both the recorded and actual event.
+
+(`RecordingEntropySource`/`ReplayingEntropySource` are the older entropy-only variants; they still work but cannot detect timer divergence.)
 
 ## Commands
 
@@ -317,7 +379,11 @@ npm run typecheck
 
 ## Design Notes
 
-- All concurrency is cooperative, not preemptive. Tasks only yield control at explicit `checkpoint`, `failpoint`, or `blockpoint` calls.
+See [TIMERS-SPEC.md](./TIMERS-SPEC.md) for the full requirements and semantics of deterministic time.
+
+- All concurrency is cooperative, not preemptive. Tasks only yield control at explicit `checkpoint`, `failpoint`, `blockpoint`, or `sleep` calls.
+- A task is a single sequential coroutine: never race two parking operations (checkpoints, failpoints, sleeps, mutex/condition-variable waits) within one task via `Promise.race`/`Promise.all`. The scheduler models exactly one park per task. Concurrency is expressed with multiple tasks; bounding work with a deadline is expressed with `withTimedSignal` and cooperative cancellation.
+- Timer durations are lower bounds, and firing order is entropy-controlled — never depend on the relative firing order of pending timers.
 - The simulation runs in a single JS event loop turn between scheduling decisions. There is no actual parallelism.
 - `SimulationImpl` should be treated as single-use per `runTasks` call. After a failed run (error or deadlock), the instance is permanently poisoned (`abortedWithError` is never reset) and subsequent `runTasks` calls will immediately fail.
 - The `sample()` function's "no entropy for single item" optimization is critical for replay correctness — it ensures the entropy consumption sequence doesn't depend on transient pool sizes.
