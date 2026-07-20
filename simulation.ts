@@ -13,7 +13,37 @@ export interface SimulationTask extends Logger, EntropySource {
     failpoint(...log: readonly unknown[]): Promise<void>;
     blockpoint(...log: readonly unknown[]): void;
 
+    /** Current monotonic time in milliseconds. Virtual in simulation, real in production. */
+    monotonicNow(): number;
+    /** Current wall-clock time in milliseconds, comparable to `Date.now()`. */
+    wallNow(): number;
+    /**
+     * Blocks until monotonic time reaches at least `now + durationMs`. The
+     * duration is a lower bound: in simulation the timer fires at an
+     * entropy-chosen point at or after the deadline, so a longer sleep may
+     * complete before a shorter one. Negative or non-finite durations throw
+     * a `TypeError`.
+     */
+    sleep(durationMs: number, reason: string): Promise<void>;
+
     abortSimulation(e: unknown): never;
+}
+
+export interface SimulationOptions {
+    /**
+     * The wall-clock time at virtual monotonic time 0, in milliseconds since
+     * the Unix epoch. Defaults to 0.
+     */
+    readonly wallClockEpoch?: number;
+}
+
+function validateSleepDuration(durationMs: number, reason: string): void {
+    if (typeof durationMs !== "number" || !Number.isFinite(durationMs) || durationMs < 0) {
+        // The stricter precedent of `AbortSignal.timeout`, which throws a
+        // `TypeError` on negative durations — `setTimeout` would silently
+        // clamp them to zero, and only in production.
+        throw new TypeError(`Sleep duration must be a finite non-negative number, got ${durationMs} for "${reason}"`);
+    }
 }
 
 export interface TaskSpec<T> {
@@ -71,6 +101,20 @@ export class NoSimulationTask implements SimulationTask {
         this.log(...log);
     }
 
+    public monotonicNow(): number {
+        return performance.now();
+    }
+
+    public wallNow(): number {
+        return Date.now();
+    }
+
+    public sleep(durationMs: number, reason: string): Promise<void> {
+        validateSleepDuration(durationMs, reason);
+        this.log(`sleep "${reason}" for ${durationMs}ms`);
+        return new Promise((resolve) => setTimeout(resolve, durationMs));
+    }
+
     public abortSimulation(e: unknown): never {
         throw exceptionToError(e);
     }
@@ -122,24 +166,47 @@ interface TaskInfo {
      * - `false`, then the task is blocked and waiting on some other task.
      */
     resolve: (() => void) | undefined | false;
+    /** Why the task is blocked, for deadlock reports. Only meaningful while `resolve` is `false`. */
+    parkReason: string | undefined;
+}
+
+interface PendingTimer {
+    readonly id: number;
+    /** Task-decorated reason, e.g. `myTask sleep: retry backoff`. */
+    readonly reason: string;
+    /** Absolute virtual monotonic deadline in milliseconds — a lower bound on the firing time. */
+    readonly deadline: number;
+    /**
+     * Runs synchronously when the timer fires, with the clock already
+     * advanced. Must only flip scheduler bookkeeping (e.g. make a sleeping
+     * task schedulable) — no task code runs inside it.
+     */
+    readonly fire: () => void;
 }
 
 export class SimulationImpl implements Simulation {
     private readonly logger: Logger;
     private readonly entropy: EntropySource;
     private readonly failpointFailureProbability: (...log: readonly unknown[]) => number;
+    private readonly wallClockEpoch: number;
     // FIXME: Should this just be a `TaskInfo[]`, since we never look at the task anyway?
     private readonly taskInfos = new Map<SimulationTask, TaskInfo>();
     private abortedWithError: unknown;
+    /** Virtual monotonic time in milliseconds. Reset per `runTasks` call. */
+    private monotonic = 0;
+    private readonly timers = new Map<number, PendingTimer>();
+    private nextTimerId = 1;
 
     constructor(
         logger: Logger,
         entropy: EntropySource,
         failpointFailureProbability: (...log: readonly unknown[]) => number,
+        options: SimulationOptions = {},
     ) {
         this.logger = logger;
         this.entropy = entropy;
         this.failpointFailureProbability = failpointFailureProbability;
+        this.wallClockEpoch = options.wallClockEpoch ?? 0;
     }
 
     private abort(e: unknown): never {
@@ -169,13 +236,47 @@ export class SimulationImpl implements Simulation {
      * already has a resolve"), and a wake-up meant for a live task can be
      * delivered to the abandoned promise instead.
      */
-    private unlockIfNecessaryAfterPark(info: TaskInfo): void {
+    private unlockIfNecessaryAfterPark(info: TaskInfo, cleanup?: () => void): void {
         try {
             this.unlockIfNecessary();
         } catch (e) {
             info.resolve = undefined;
+            info.parkReason = undefined;
+            cleanup?.();
             throw e;
         }
+    }
+
+    private registerTimer(reason: string, deadline: number, fire: () => void): number {
+        const id = this.nextTimerId++;
+        this.timers.set(id, { id, reason, deadline, fire });
+        this.logger.log(`TIMER '${reason}' created at t=${this.monotonic}ms with deadline t=${deadline}ms`);
+        return id;
+    }
+
+    /**
+     * Fires an entropy-chosen pending timer. Any pending timer may fire —
+     * deadlines are only lower bounds, so a later-deadline timer may fire
+     * before an earlier one. The clock advances to `max(now, deadline)`,
+     * which keeps virtual time monotonic even for late firings.
+     */
+    private fireNextTimer(): void {
+        const timers = Array.from(this.timers.values());
+        const timer = sample(this.entropy, `Picking timer out of ${timers.map((t) => t.reason).join(", ")}`, timers);
+        assert(timer !== undefined, "No timers to pick from");
+        this.timers.delete(timer.id);
+        this.monotonic = Math.max(this.monotonic, timer.deadline);
+        this.logger.log(`TIMER '${timer.reason}' fired at t=${this.monotonic}ms (deadline t=${timer.deadline}ms)`);
+        timer.fire();
+    }
+
+    private makeDeadlockError(infos: readonly TaskInfo[]): Error {
+        const blocked = infos
+            .map((i) => `${i.name}${i.parkReason !== undefined ? ` (${i.parkReason})` : ""}`)
+            .join(", ");
+        return new Error(
+            `Deadlock at t=${this.monotonic}ms: all tasks are blocked and no timers are pending. Blocked tasks: ${blocked}`,
+        );
     }
 
     private unlockIfNecessary(): void {
@@ -183,18 +284,30 @@ export class SimulationImpl implements Simulation {
 
         if (this.taskInfos.size === 0) return;
 
-        const entries = Array.from(this.taskInfos.entries());
-        if (entries.some(([, i]) => i.resolve === undefined)) {
-            // Some tasks are still runing, so there's nothing to do yet.
+        const infos = Array.from(this.taskInfos.values());
+        if (infos.some((i) => i.resolve === undefined)) {
+            // Some tasks are still running, so there's nothing to do yet.
             return;
         }
-        const checkpointEntries = entries.filter(([, i]) => i.resolve !== undefined && i.resolve !== false);
-        assert(checkpointEntries.length > 0, "All tasks are blocked");
-        const info = this.pickTask(checkpointEntries.map(([, i]) => i));
-        this.logger.log(`${info.name} UNBLOCKED from ${entries.map(([, i]) => i.name).join(", ")}`);
+        const checkpointed = () => infos.filter((i) => i.resolve !== undefined && i.resolve !== false);
+        let candidates = checkpointed();
+        while (candidates.length === 0) {
+            // No task is runnable. If timers are pending, one of them fires
+            // and virtual time advances — the simulation must never advance
+            // time while runnable tasks exist, and must never deadlock while
+            // a timer could still wake somebody.
+            if (this.timers.size === 0) {
+                throw this.makeDeadlockError(infos);
+            }
+            this.fireNextTimer();
+            candidates = checkpointed();
+        }
+        const info = this.pickTask(candidates);
+        this.logger.log(`${info.name} UNBLOCKED at t=${this.monotonic}ms from ${infos.map((i) => i.name).join(", ")}`);
         const { resolve } = info;
         assert(resolve !== undefined && resolve !== false);
         info.resolve = undefined;
+        info.parkReason = undefined;
         resolve();
     }
 
@@ -210,8 +323,15 @@ export class SimulationImpl implements Simulation {
     > {
         const simulation = this;
 
+        // Timer and clock state is per-run: a fresh `runTasks` on a reused
+        // instance must not observe timers or virtual time from an earlier
+        // run.
+        this.monotonic = 0;
+        this.timers.clear();
+        this.nextTimerId = 1;
+
         const tasksAndInfos = specs.map((s) => {
-            const info: TaskInfo = { name: s.name, resolve: undefined };
+            const info: TaskInfo = { name: s.name, resolve: undefined, parkReason: undefined };
             const task: SimulationTask = {
                 random(name: string): number {
                     const r = simulation.entropy.random(`${s.name} random number: ${name}`);
@@ -233,6 +353,7 @@ export class SimulationImpl implements Simulation {
                     const promise = new Promise<void>((resolve) => {
                         assert(info.resolve === undefined || info.resolve === false);
                         info.resolve = resolve;
+                        info.parkReason = undefined;
                     });
                     simulation.unlockIfNecessaryAfterPark(info);
                     return promise;
@@ -265,6 +386,7 @@ export class SimulationImpl implements Simulation {
                             `Task ${s.name} already has a resolve`,
                         );
                         info.resolve = resolve;
+                        info.parkReason = undefined;
                     });
                     simulation.unlockIfNecessaryAfterPark(info);
                     return promise;
@@ -274,7 +396,47 @@ export class SimulationImpl implements Simulation {
                     assert(simulation.taskInfos.has(task));
                     assert(info.resolve === undefined, `Task ${s.name} already has a resolve`);
                     info.resolve = false;
+                    info.parkReason = log.map(String).join(" ");
                     simulation.unlockIfNecessaryAfterPark(info);
+                },
+                monotonicNow(): number {
+                    return simulation.monotonic;
+                },
+                wallNow(): number {
+                    return simulation.wallClockEpoch + simulation.monotonic;
+                },
+                sleep(durationMs: number, reason: string): Promise<void> {
+                    validateSleepDuration(durationMs, reason);
+                    assert(simulation.taskInfos.has(task), `Task ${s.name} wants to sleep, but doesn't exist anymore`);
+                    const deadline = simulation.monotonic + durationMs;
+                    simulation.logger.log(
+                        `${s.name} SLEEP '${reason}' at t=${simulation.monotonic}ms for ${durationMs}ms until t=${deadline}ms`,
+                    );
+                    let timerId: number | undefined;
+                    const promise = new Promise<void>((resolve) => {
+                        assert(info.resolve === undefined, `Task ${s.name} already has a resolve`);
+                        // The task sleeps in its single park slot: blocked
+                        // like a blockpoint, woken by exactly one timer. The
+                        // timer's `fire` flips the slot to a schedulable
+                        // continuation; the scheduler then picks the task
+                        // like any other checkpointed one.
+                        info.resolve = false;
+                        info.parkReason = `sleeping '${reason}' until t=${deadline}ms`;
+                        timerId = simulation.registerTimer(`${s.name} sleep: ${reason}`, deadline, () => {
+                            info.parkReason = undefined;
+                            info.resolve = resolve;
+                        });
+                    });
+                    // Exception safety: a synchronous throw out of the
+                    // scheduling that follows the park (entropy guard, abort)
+                    // means the task is NOT sleeping — it is running its
+                    // error path. Both the park slot and the just-registered
+                    // timer must be rolled back, otherwise the timer would
+                    // later ghost-wake a task that isn't parked.
+                    simulation.unlockIfNecessaryAfterPark(info, () => {
+                        if (timerId !== undefined) simulation.timers.delete(timerId);
+                    });
+                    return promise;
                 },
                 abortSimulation(e): never {
                     return simulation.abort(e);
