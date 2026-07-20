@@ -75,6 +75,17 @@ export interface SimulationOptions {
      * logged via the logger; setting this aborts the simulation instead.
      */
     readonly failOnLateCompletion?: boolean;
+    /**
+     * Aborts the simulation when it makes more than this many scheduling
+     * decisions (task unblocks and timer firings). The failure reports
+     * whether virtual time was still advancing: a step budget exhausted at
+     * a fixed virtual time is the signature of a zero-duration-timer or
+     * checkpoint livelock, while exhaustion with time advancing means the
+     * scenario outgrew its budget.
+     */
+    readonly maxSchedulingSteps?: number;
+    /** Aborts the simulation when a timer firing would advance the virtual clock past this. */
+    readonly maxVirtualDurationMs?: number;
 }
 
 function validateSleepDuration(durationMs: number, reason: string): void {
@@ -291,6 +302,10 @@ export class SimulationImpl implements Simulation {
     private nextTimerId = 1;
     private readonly activeDeadlines = new Set<ActiveDeadline>();
     private readonly failOnLateCompletion: boolean;
+    private readonly maxSchedulingSteps: number | undefined;
+    private readonly maxVirtualDurationMs: number | undefined;
+    private steps = 0;
+    private lastAdvanceStep = 0;
     /**
      * Set while a user 'abort' listener is dispatching. Task APIs called
      * from listener context corrupt scheduler bookkeeping or entropy-stream
@@ -309,6 +324,22 @@ export class SimulationImpl implements Simulation {
         this.failpointFailureProbability = failpointFailureProbability;
         this.wallClockEpoch = options.wallClockEpoch ?? 0;
         this.failOnLateCompletion = options.failOnLateCompletion ?? false;
+        this.maxSchedulingSteps = options.maxSchedulingSteps;
+        this.maxVirtualDurationMs = options.maxVirtualDurationMs;
+    }
+
+    private countStep(): void {
+        this.steps++;
+        if (this.maxSchedulingSteps === undefined || this.steps <= this.maxSchedulingSteps) return;
+        const stuckSteps = this.steps - this.lastAdvanceStep;
+        // A budget spent mostly at a fixed virtual time is a livelock
+        // signature; a budget spent while time kept advancing means the
+        // scenario is just bigger than the budget.
+        const detail =
+            stuckSteps * 2 >= this.maxSchedulingSteps
+                ? `Virtual time has been stuck at t=${this.monotonic}ms for ${stuckSteps} steps — the signature of a zero-duration-timer or checkpoint livelock.`
+                : `Virtual time was still advancing (last advance ${stuckSteps} steps ago) — the scenario may have outgrown its step budget.`;
+        throw new Error(`Maximum scheduling steps (${this.maxSchedulingSteps}) exceeded at t=${this.monotonic}ms. ${detail}`);
     }
 
     private assertNotInAbortListener(what: string): void {
@@ -337,6 +368,12 @@ export class SimulationImpl implements Simulation {
     private abort(e: unknown): never {
         if (this.abortedWithError === undefined) {
             this.abortedWithError = e;
+            // Cancellation cleanup: pending timers must not survive an
+            // aborted run. (unlockIfNecessary rethrows the abort error
+            // before ever firing a timer, but there's no reason to keep
+            // them around.)
+            this.timers.clear();
+            this.activeDeadlines.clear();
             this.logger.error(`Aborting simulation: ${exceptionToString(e)}`);
         }
         throw e;
@@ -386,11 +423,22 @@ export class SimulationImpl implements Simulation {
      * which keeps virtual time monotonic even for late firings.
      */
     private fireNextTimer(): void {
+        this.countStep();
         const timers = Array.from(this.timers.values());
         const timer = sample(this.entropy, `Picking timer out of ${timers.map((t) => t.reason).join(", ")}`, timers);
         assert(timer !== undefined, "No timers to pick from");
+        const newNow = Math.max(this.monotonic, timer.deadline);
+        if (this.maxVirtualDurationMs !== undefined && newNow > this.maxVirtualDurationMs) {
+            throw new Error(
+                `Maximum virtual duration (${this.maxVirtualDurationMs}ms) exceeded: ` +
+                    `timer '${timer.reason}' would advance the clock to t=${newNow}ms`,
+            );
+        }
         this.timers.delete(timer.id);
-        this.monotonic = Math.max(this.monotonic, timer.deadline);
+        if (newNow > this.monotonic) {
+            this.monotonic = newNow;
+            this.lastAdvanceStep = this.steps;
+        }
         this.logger.log(`TIMER '${timer.reason}' fired at t=${this.monotonic}ms (deadline t=${timer.deadline}ms)`);
         timer.fire();
     }
@@ -437,6 +485,7 @@ export class SimulationImpl implements Simulation {
             this.fireNextTimer();
             candidates = checkpointed();
         }
+        this.countStep();
         const info = this.pickTask(candidates);
         this.logger.log(`${info.name} UNBLOCKED at t=${this.monotonic}ms from ${infos.map((i) => i.name).join(", ")}`);
         const { resolve } = info;
@@ -465,6 +514,8 @@ export class SimulationImpl implements Simulation {
         this.timers.clear();
         this.nextTimerId = 1;
         this.activeDeadlines.clear();
+        this.steps = 0;
+        this.lastAdvanceStep = 0;
 
         const tasksAndInfos = specs.map((s) => {
             const info: TaskInfo = { name: s.name, resolve: undefined, parkReason: undefined };

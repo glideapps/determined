@@ -904,3 +904,77 @@ describe("noSimulation real time", () => {
         );
     });
 });
+
+describe("safety guards", () => {
+    // Acceptance test 13: maximum-step and maximum-virtual-time guards
+    // terminate pathological tests; a step budget exhausted at a fixed
+    // virtual time is reported as a livelock.
+    it("a checkpoint livelock exhausts the step budget and is reported as a livelock", async () => {
+        const sim = makeSim([], { maxSchedulingSteps: 100 });
+        const result = await sim.runTasks([
+            {
+                name: "spinner",
+                f: async (task: SimulationTask) => {
+                    for (;;) {
+                        await task.checkpoint("spin");
+                    }
+                },
+            },
+        ]);
+        assert.ok(result.isErr());
+        assert.match(result.error.message, /Maximum scheduling steps \(100\) exceeded/);
+        assert.match(result.error.message, /livelock/);
+        assert.match(result.error.message, /t=0ms/);
+    });
+
+    it("an endlessly rescheduled zero-duration timer is reported as a livelock", async () => {
+        const sim = makeSim([], { maxSchedulingSteps: 100 });
+        const result = await sim.runTasks([
+            {
+                name: "spinner",
+                f: async (task: SimulationTask) => {
+                    for (;;) {
+                        await task.sleep(0, "spin");
+                    }
+                },
+            },
+        ]);
+        assert.ok(result.isErr());
+        assert.match(result.error.message, /livelock/);
+        assert.match(result.error.message, /t=0ms/);
+    });
+
+    it("a step budget exhausted while virtual time advances is not reported as a livelock", async () => {
+        const sim = makeSim([], { maxSchedulingSteps: 100 });
+        const result = await sim.runTasks([
+            {
+                name: "ticker",
+                f: async (task: SimulationTask) => {
+                    for (;;) {
+                        await task.sleep(10, "tick");
+                    }
+                },
+            },
+        ]);
+        assert.ok(result.isErr());
+        assert.match(result.error.message, /Maximum scheduling steps \(100\) exceeded/);
+        assert.doesNotMatch(result.error.message, /livelock/);
+        assert.match(result.error.message, /still advancing/);
+    });
+
+    it("the maximum virtual duration terminates a runaway clock", async () => {
+        const sim = makeSim([], { maxVirtualDurationMs: 60_000 });
+        const result = await sim.runTasks([
+            {
+                name: "far-future",
+                f: async (task: SimulationTask) => {
+                    await task.sleep(10_000, "fine");
+                    await task.sleep(1_000_000, "too far");
+                },
+            },
+        ]);
+        assert.ok(result.isErr());
+        assert.match(result.error.message, /Maximum virtual duration \(60000ms\) exceeded/);
+        assert.match(result.error.message, /too far/);
+    });
+});
