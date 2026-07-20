@@ -1,0 +1,41 @@
+name: Publish
+
+on:
+    release:
+        types: [published]
+
+jobs:
+    publish:
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+            # Required for npm provenance
+            id-token: write
+        steps:
+            - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+            # tsdown requires ^22.18.0 || >=24.11.0
+            - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+              with:
+                  node-version: 24
+                  cache: npm
+                  registry-url: https://registry.npmjs.org
+
+            - run: npm ci
+
+            - run: npm run typecheck
+
+            - run: npm test
+
+            # Take the version from the release tag (strip a leading "v").
+            - name: Set version from release tag
+              run: npm version --no-git-tag-version "${TAG#v}"
+              env:
+                  TAG: ${{ github.event.release.tag_name }}
+
+            # prepublishOnly runs the build. GitHub prereleases go to the
+            # "next" dist-tag so they never become npm's "latest".
+            - run: npm publish --provenance --tag "${DIST_TAG}"
+              env:
+                  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+                  DIST_TAG: ${{ github.event.release.prerelease && 'next' || 'latest' }}
