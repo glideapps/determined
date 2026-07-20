@@ -33,9 +33,10 @@ jobs:
               env:
                   TAG: ${{ github.event.release.tag_name }}
 
-            # prepublishOnly runs the build. GitHub prereleases go to the
-            # "next" dist-tag so they never become npm's "latest".
+            # Auth is via npm trusted publishing (OIDC, requires the
+            # id-token permission above) — no token secret. prepublishOnly
+            # runs the build. GitHub prereleases go to the "next" dist-tag
+            # so they never become npm's "latest".
             - run: npm publish --provenance --tag "${DIST_TAG}"
               env:
-                  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
                   DIST_TAG: ${{ github.event.release.prerelease && 'next' || 'latest' }}
