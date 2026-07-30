@@ -5,6 +5,14 @@ import { ApplicationFailure, CancellationError } from "./errors.ts";
 import { isTimerTraceSink, type TimerTraceSink } from "./trace.ts";
 import { err, ok, type Result } from "neverthrow";
 
+/**
+ * Schedules a macrotask: runs strictly after the entire microtask queue —
+ * including all promise-continuation chains — has drained. `setImmediate`
+ * where available (Node, Bun), `setTimeout(0)` otherwise.
+ */
+const scheduleMacrotask: (f: () => void) => void =
+    typeof setImmediate === "function" ? setImmediate : (f) => setTimeout(f, 0);
+
 export interface Logger {
     log(...log: readonly unknown[]): void;
     error(...log: readonly unknown[]): void;
@@ -339,6 +347,17 @@ export class SimulationImpl implements Simulation {
      * stability, so they fail descriptively instead.
      */
     private inUserAbortListener = false;
+    /** Bumped per `runTasks` call so quiescence probes from a previous run no-op. */
+    private runToken = 0;
+    /** True while a quiescence probe is scheduled for the current run. */
+    private probeArmed = false;
+    /**
+     * Rejects the current run's out-of-band failure channel. Errors raised
+     * from a quiescence probe (deadlock, exhausted budgets, trace
+     * divergence) have no task stack to propagate through, so they fail
+     * `runTasks` directly via this instead.
+     */
+    private rejectRun: ((e: unknown) => void) | undefined;
 
     constructor(
         logger: Logger,
@@ -394,17 +413,20 @@ export class SimulationImpl implements Simulation {
         }
     }
 
+    private recordAbort(e: unknown): void {
+        if (this.abortedWithError !== undefined) return;
+        this.abortedWithError = e;
+        // Cancellation cleanup: pending timers must not survive an
+        // aborted run. (unlockIfNecessary rethrows the abort error
+        // before ever firing a timer, but there's no reason to keep
+        // them around.)
+        this.timers.clear();
+        this.activeDeadlines.clear();
+        this.logger.error(`Aborting simulation: ${exceptionToString(e)}`);
+    }
+
     private abort(e: unknown): never {
-        if (this.abortedWithError === undefined) {
-            this.abortedWithError = e;
-            // Cancellation cleanup: pending timers must not survive an
-            // aborted run. (unlockIfNecessary rethrows the abort error
-            // before ever firing a timer, but there's no reason to keep
-            // them around.)
-            this.timers.clear();
-            this.activeDeadlines.clear();
-            this.logger.error(`Aborting simulation: ${exceptionToString(e)}`);
-        }
+        this.recordAbort(e);
         throw e;
     }
 
@@ -503,7 +525,15 @@ export class SimulationImpl implements Simulation {
 
     private makeDeadlockError(infos: readonly TaskInfo[]): Error {
         const blocked = infos
-            .map((i) => `${i.name}${i.parkReason !== undefined ? ` (${i.parkReason})` : ""}`)
+            .map((i) => {
+                // A task still marked running at a quiescence probe is
+                // suspended on a promise the simulation doesn't manage —
+                // name that, since it has no parkReason of its own.
+                const reason =
+                    i.parkReason ??
+                    (i.resolve === undefined ? "awaiting a promise not managed by the simulation" : undefined);
+                return `${i.name}${reason !== undefined ? ` (${reason})` : ""}`;
+            })
             .join(", ");
         let message = `Deadlock at t=${this.monotonic}ms: all tasks are blocked and no timers are pending. Blocked tasks: ${blocked}.`;
         // A blocked task holding an already-aborted signal is the typical
@@ -527,9 +557,46 @@ export class SimulationImpl implements Simulation {
 
         const infos = Array.from(this.taskInfos.values());
         if (infos.some((i) => i.resolve === undefined)) {
-            // Some tasks are still running, so there's nothing to do yet.
+            // Some tasks are still running, so there's nothing to do yet —
+            // but "running" is trusted bookkeeping, not observed fact: a
+            // task that awaits a promise the simulation doesn't manage
+            // stays marked running without ever re-entering the scheduler.
+            // The quiescence probe re-checks once the runtime has actually
+            // gone idle.
+            this.armQuiescenceProbe();
             return;
         }
+        this.scheduleNext(infos);
+    }
+
+    /**
+     * Picks and resumes an entropy-chosen task among `candidates` (all
+     * parked at a checkpoint). Tasks marked running (`resolve ===
+     * undefined`) are never candidates: callers guarantee they are either
+     * genuinely running (unlockIfNecessary, which requires none) or
+     * provably suspended on unmanaged promises (the quiescence probe).
+     */
+    private resumeCandidate(infos: readonly TaskInfo[], candidates: readonly TaskInfo[]): void {
+        this.countStep();
+        const info = this.pickTask(candidates);
+        this.logger.log(`${info.name} UNBLOCKED at t=${this.monotonic}ms from ${infos.map((i) => i.name).join(", ")}`);
+        const { resolve } = info;
+        assert(resolve !== undefined && resolve !== false);
+        info.resolve = undefined;
+        info.parkReason = undefined;
+        resolve();
+        // The resumed task may suspend on an unmanaged promise instead of
+        // re-entering the scheduler; the probe catches that.
+        this.armQuiescenceProbe();
+    }
+
+    /**
+     * The synchronous scheduling path: every task is parked or blocked
+     * (none marked running), so timer fires can only flip scheduler
+     * bookkeeping and it is safe to fire several in a row until a task
+     * becomes schedulable.
+     */
+    private scheduleNext(infos: readonly TaskInfo[]): void {
         const checkpointed = () => infos.filter((i) => i.resolve !== undefined && i.resolve !== false);
         let candidates = checkpointed();
         while (candidates.length === 0) {
@@ -543,14 +610,75 @@ export class SimulationImpl implements Simulation {
             this.fireNextTimer();
             candidates = checkpointed();
         }
-        this.countStep();
-        const info = this.pickTask(candidates);
-        this.logger.log(`${info.name} UNBLOCKED at t=${this.monotonic}ms from ${infos.map((i) => i.name).join(", ")}`);
-        const { resolve } = info;
-        assert(resolve !== undefined && resolve !== false);
-        info.resolve = undefined;
-        info.parkReason = undefined;
-        resolve();
+        this.resumeCandidate(infos, candidates);
+    }
+
+    /**
+     * Arms a one-shot probe that runs when the JS runtime goes quiescent.
+     * A macrotask runs only after the whole microtask queue — every
+     * pending task continuation — has drained, so state observed by the
+     * probe is settled fact, not in-flight bookkeeping. One pending probe
+     * covers an entire synchronous/microtask cascade, however many
+     * scheduler entries it contains.
+     */
+    private armQuiescenceProbe(): void {
+        if (this.probeArmed) return;
+        if (this.abortedWithError !== undefined) return;
+        if (this.taskInfos.size === 0) return;
+        const token = this.runToken;
+        this.probeArmed = true;
+        scheduleMacrotask(() => {
+            // A stale probe from an earlier run must not touch the current
+            // run's state — including its probeArmed flag.
+            if (token !== this.runToken) return;
+            this.probeArmed = false;
+            try {
+                this.onQuiescence();
+            } catch (e) {
+                // No task stack to throw into: record the abort and fail
+                // the run through the out-of-band channel.
+                this.recordAbort(e);
+                this.rejectRun?.(e);
+            }
+        });
+    }
+
+    /**
+     * Runs at quiescence: no task code on the stack, microtask queue
+     * empty. A task still marked running now is not running — it is
+     * suspended on a promise the simulation doesn't manage (another
+     * task's promise, a bare deferred). Treat those tasks as blocked and
+     * schedule one step: parked tasks keep running, pending timers fire
+     * and advance virtual time (settling cross-task promise shapes like
+     * singleflight), and if nothing can progress the run fails loudly
+     * with a deadlock report instead of hanging silently.
+     */
+    private onQuiescence(): void {
+        if (this.abortedWithError !== undefined) return;
+        if (this.taskInfos.size === 0) return;
+        const infos = Array.from(this.taskInfos.values());
+        if (!infos.some((i) => i.resolve === undefined)) {
+            // Nobody is suspended on an unmanaged promise; the scheduler
+            // already handled this state synchronously.
+            return;
+        }
+        const candidates = infos.filter((i) => i.resolve !== undefined && i.resolve !== false);
+        if (candidates.length > 0) {
+            this.resumeCandidate(infos, candidates);
+            return;
+        }
+        if (this.timers.size === 0) {
+            throw this.makeDeadlockError(infos);
+        }
+        // Unlike the synchronous path, fire exactly ONE timer per probe: a
+        // deadline timer's abort listeners may settle promises whose
+        // cascades resume suspended tasks, and those continuations sit in
+        // the microtask queue until this macrotask returns. Firing further
+        // timers here could advance time past a wake-up already in flight,
+        // or misreport a deadlock. Re-arming yields until the cascade has
+        // drained, then the next probe re-evaluates.
+        this.fireNextTimer();
+        this.armQuiescenceProbe();
     }
 
     public async runTasks<TSpecs extends readonly TaskSpec<any>[]>(
@@ -574,6 +702,13 @@ export class SimulationImpl implements Simulation {
         this.activeDeadlines.clear();
         this.steps = 0;
         this.lastAdvanceStep = 0;
+        this.runToken++;
+        this.probeArmed = false;
+        let rejectRun!: (e: unknown) => void;
+        const runFailure = new Promise<never>((_resolve, reject) => {
+            rejectRun = reject;
+        });
+        this.rejectRun = rejectRun;
 
         const tasksAndInfos = specs.map((s) => {
             const info: TaskInfo = { name: s.name, resolve: undefined, parkReason: undefined };
@@ -820,23 +955,28 @@ export class SimulationImpl implements Simulation {
             // In the try so that a replay divergence on the recorded epoch
             // fails the run like any other divergence.
             this.timerTrace?.runStart(this.wallClockEpoch);
-            const results = (await Promise.all(
-                tasksAndInfos.map(([s, task]) => {
-                    return task
-                        .checkpoint("START")
-                        .then(() => s.f(task))
-                        .catch((e) => this.abort(e))
-                        .finally(() => {
-                            this.taskInfos.delete(task);
-                            this.logger.log(
-                                `FINISHED ${s.name}, still left ${Array.from(this.taskInfos.values())
-                                    .map((i) => i.name)
-                                    .join(", ")}`,
-                            );
-                            this.unlockIfNecessary();
-                        });
-                }),
-            )) as any; // I wish we could type this better
+            // Racing against `runFailure` lets a quiescence probe fail the
+            // run even though the stuck tasks' promises never settle.
+            const results = (await Promise.race([
+                Promise.all(
+                    tasksAndInfos.map(([s, task]) => {
+                        return task
+                            .checkpoint("START")
+                            .then(() => s.f(task))
+                            .catch((e) => this.abort(e))
+                            .finally(() => {
+                                this.taskInfos.delete(task);
+                                this.logger.log(
+                                    `FINISHED ${s.name}, still left ${Array.from(this.taskInfos.values())
+                                        .map((i) => i.name)
+                                        .join(", ")}`,
+                                );
+                                this.unlockIfNecessary();
+                            });
+                    }),
+                ),
+                runFailure,
+            ])) as any; // I wish we could type this better
             return ok(results);
         } catch (e: unknown) {
             // A synchronous throw out of a START checkpoint (e.g. an entropy
