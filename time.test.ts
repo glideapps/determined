@@ -3,6 +3,7 @@ import assert from "node:assert";
 import { defined } from "@glideapps/ts-necessities";
 import { NoSimulationTask, noSimulation, SimulationImpl, type SimulationTask } from "./simulation.ts";
 import { RecordingEntropySource, ReplayingEntropySource, SimpleEntropySource } from "./entropy.ts";
+import { RecordingTraceSource, ReplayingTraceSource } from "./trace.ts";
 import { isApplicationFailure, isCancellation } from "./errors.ts";
 import { Mutex } from "./mutex.ts";
 import { ConditionVariable } from "./condition-variable.ts";
@@ -1095,5 +1096,551 @@ describe("timer pick policy", () => {
         ]);
         assert.ok(result.isOk(), `expected ok, got err: ${result.isErr() ? result.error.message : ""}`);
         assert.deepStrictEqual(result.value, [1_000]);
+    });
+});
+
+describe("cross-task promise sharing", () => {
+    // These tests cover DETERMINED-BUG.md: a task awaiting a promise that
+    // will be settled by another task (the singleflight/coalescing shape)
+    // must complete — the scheduler must advance time to pending timers
+    // even while a task is suspended on a promise it doesn't manage, and
+    // must fail loudly (never hang silently) when nothing can progress.
+    //
+    // A hang can't fail a test by itself, so every runTasks is raced
+    // against a real-time timeout that turns a hang into an assertion
+    // failure instead of a stuck test runner.
+    const HANG = Symbol("hang");
+    async function withHangGuard<T>(run: Promise<T>): Promise<T> {
+        let timer: NodeJS.Timeout | undefined;
+        const timeout = new Promise<typeof HANG>((resolve) => {
+            timer = setTimeout(() => resolve(HANG), 2_000);
+        });
+        const raced = await Promise.race([run, timeout]);
+        clearTimeout(timer);
+        if (raced === HANG) assert.fail("simulation hung: runTasks never settled");
+        return raced;
+    }
+
+    function makeCrossTaskSim(entropy: ConstructorParameters<typeof SimulationImpl>[1]): SimulationImpl {
+        return new SimulationImpl(new ArrayLogger(), entropy, () => 0, {
+            maxSchedulingSteps: 10_000,
+            maxVirtualDurationMs: 60_000,
+        });
+    }
+
+    // The direct repro from DETERMINED-BUG.md. Always-zero entropy forces
+    // the deadlocking schedule: the owner runs first, publishes its
+    // promise, and sleeps; the waiter then awaits the foreign promise
+    // directly. (Under random entropy the scheduler can happen to fire the
+    // owner's timer before the waiter awaits, masking the bug.)
+    it("a task awaiting a promise settled by another task's timer completes", async () => {
+        const sim = makeCrossTaskSim({ random: () => 0 });
+        let shared: Promise<string> | undefined;
+        let settled = false;
+        let waiterSawSettled: boolean | undefined;
+        const result = await withHangGuard(
+            sim.runTasks([
+                {
+                    name: "owner",
+                    f: async (task: SimulationTask) => {
+                        shared = task.sleep(10, "work").then(() => {
+                            settled = true;
+                            return "done";
+                        });
+                        return await shared;
+                    },
+                },
+                {
+                    name: "waiter",
+                    f: async (task: SimulationTask) => {
+                        // Wait until the owner has published its promise, then await it.
+                        while (shared === undefined) await task.sleep(1, "poll");
+                        waiterSawSettled = settled;
+                        return await shared;
+                    },
+                },
+            ]),
+        );
+        assert.ok(result.isOk(), `expected ok, got err: ${result.isErr() ? result.error.message : ""}`);
+        assert.deepStrictEqual(result.value, ["done", "done"]);
+        // Guard the repro itself: the waiter must have suspended on the
+        // promise while it was still pending — otherwise this test isn't
+        // exercising the cross-task wait at all.
+        assert.strictEqual(waiterSawSettled, false);
+    });
+
+    // The motivating use case: singleflight. Several waiters coalesce on
+    // one in-flight operation and all receive its result. Waiters resumed
+    // by the shared promise settling run in promise-reaction order, not
+    // entropy order — so also assert the whole run is deterministic by
+    // running it twice and comparing the recorded resume orders.
+    it("multiple waiters coalescing on one in-flight promise all complete deterministically", async () => {
+        async function runScenario(): Promise<{ values: readonly string[]; order: string[] }> {
+            const sim = makeCrossTaskSim({ random: () => 0 });
+            const order: string[] = [];
+            let inFlight: Promise<string> | undefined;
+            const fetchOnce = (task: SimulationTask): Promise<string> => {
+                inFlight ??= task.sleep(50, "fetch").then(() => "payload");
+                return inFlight;
+            };
+            const makeWaiter = (name: string) => ({
+                name,
+                f: async (task: SimulationTask) => {
+                    while (inFlight === undefined) await task.sleep(1, "poll");
+                    const value = await inFlight;
+                    order.push(name);
+                    return value;
+                },
+            });
+            const result = await withHangGuard(
+                sim.runTasks([
+                    {
+                        name: "fetcher",
+                        f: async (task: SimulationTask) => {
+                            const value = await fetchOnce(task);
+                            order.push("fetcher");
+                            return value;
+                        },
+                    },
+                    makeWaiter("waiterA"),
+                    makeWaiter("waiterB"),
+                    makeWaiter("waiterC"),
+                ]),
+            );
+            assert.ok(result.isOk(), `expected ok, got err: ${result.isErr() ? result.error.message : ""}`);
+            return { values: result.value, order };
+        }
+
+        const first = await runScenario();
+        assert.deepStrictEqual(first.values, ["payload", "payload", "payload", "payload"]);
+        assert.strictEqual(first.order.length, 4);
+        const second = await runScenario();
+        assert.deepStrictEqual(second.order, first.order);
+    });
+
+    // A task suspended on a foreign promise must not stall the rest of the
+    // simulation: a checkpoint-parked task keeps running, at the current
+    // virtual time, before any timer fires.
+    it("a checkpointing task keeps running while another task awaits a foreign promise", async () => {
+        const sim = makeCrossTaskSim({ random: () => 0 });
+        let shared: Promise<string> | undefined;
+        const workerTimes: number[] = [];
+        const result = await withHangGuard(
+            sim.runTasks([
+                {
+                    name: "owner",
+                    f: async (task: SimulationTask) => {
+                        shared = task.sleep(10, "work").then(() => "done");
+                        return await shared;
+                    },
+                },
+                {
+                    name: "waiter",
+                    f: async (task: SimulationTask) => {
+                        while (shared === undefined) await task.sleep(1, "poll");
+                        return await shared;
+                    },
+                },
+                {
+                    name: "worker",
+                    f: async (task: SimulationTask) => {
+                        workerTimes.push(task.monotonicNow());
+                        await task.checkpoint("mid");
+                        workerTimes.push(task.monotonicNow());
+                        return "worked";
+                    },
+                },
+            ]),
+        );
+        assert.ok(result.isOk(), `expected ok, got err: ${result.isErr() ? result.error.message : ""}`);
+        assert.deepStrictEqual(result.value, ["done", "done", "worked"]);
+        // The worker never sleeps, so it must have run to completion at
+        // t=0 — before the scheduler advanced time to the owner's timer.
+        assert.deepStrictEqual(workerTimes, [0, 0]);
+    });
+
+    // A foreign promise settled directly by another running task — no
+    // timer involved. The waiter is listed first so always-zero entropy
+    // schedules it first and it suspends on the still-unsettled promise;
+    // the scheduler must keep running the resolver and must not misreport
+    // a deadlock while the settling cascade is still in the microtask
+    // queue.
+    it("a foreign promise settled by another task without a timer completes", async () => {
+        const sim = makeCrossTaskSim({ random: () => 0 });
+        let resolveShared!: (value: string) => void;
+        const shared = new Promise<string>((resolve) => {
+            resolveShared = resolve;
+        });
+        const result = await withHangGuard(
+            sim.runTasks([
+                {
+                    name: "waiter",
+                    f: async () => {
+                        return await shared;
+                    },
+                },
+                {
+                    name: "resolver",
+                    f: async (task: SimulationTask) => {
+                        await task.checkpoint("before resolve");
+                        resolveShared("payload");
+                        return "resolved";
+                    },
+                },
+            ]),
+        );
+        assert.ok(result.isOk(), `expected ok, got err: ${result.isErr() ? result.error.message : ""}`);
+        assert.deepStrictEqual(result.value, ["payload", "resolved"]);
+    });
+
+    // Promise.all spanning tasks: the waiter joins on two promises settled
+    // by two different tasks' timers.
+    it("Promise.all over promises from different tasks completes", async () => {
+        const sim = makeCrossTaskSim({ random: () => 0 });
+        let sharedA: Promise<string> | undefined;
+        let sharedB: Promise<string> | undefined;
+        const result = await withHangGuard(
+            sim.runTasks([
+                {
+                    name: "ownerA",
+                    f: async (task: SimulationTask) => {
+                        sharedA = task.sleep(10, "work A").then(() => "A");
+                        return await sharedA;
+                    },
+                },
+                {
+                    name: "ownerB",
+                    f: async (task: SimulationTask) => {
+                        sharedB = task.sleep(20, "work B").then(() => "B");
+                        return await sharedB;
+                    },
+                },
+                {
+                    name: "waiter",
+                    f: async (task: SimulationTask) => {
+                        while (sharedA === undefined || sharedB === undefined) await task.sleep(1, "poll");
+                        return await Promise.all([sharedA, sharedB]);
+                    },
+                },
+            ]),
+        );
+        assert.ok(result.isOk(), `expected ok, got err: ${result.isErr() ? result.error.message : ""}`);
+        assert.deepStrictEqual(result.value, ["A", "B", ["A", "B"]]);
+    });
+
+    // A timer whose only effect is settling a foreign promise: a deadline
+    // whose abort listener resolves a deferred (listeners are documented
+    // as allowed to "settle a low-level promise"). Firing it produces no
+    // schedulable task synchronously — the wake-up sits in the microtask
+    // queue — so the scheduler must wait for the cascade instead of
+    // misreporting a deadlock.
+    it("a timer that settles only a foreign promise does not deadlock", async () => {
+        const sim = makeCrossTaskSim({ random: () => 0 });
+        let resolveShared!: (value: string) => void;
+        const shared = new Promise<string>((resolve) => {
+            resolveShared = resolve;
+        });
+        const result = await withHangGuard(
+            sim.runTasks([
+                {
+                    name: "creator",
+                    f: async (task: SimulationTask) => {
+                        const deadline = task.createDeadline(5, "settle shared");
+                        deadline.signal.addEventListener("abort", () => resolveShared("settled"), { once: true });
+                        return "created";
+                    },
+                },
+                {
+                    name: "waiter",
+                    f: async (task: SimulationTask) => {
+                        // A deeper reaction chain than a bare await: the
+                        // whole cascade must drain before the scheduler
+                        // decides anything.
+                        const value = await shared.then((v) => v).then((v) => v);
+                        return `${value} at t=${task.monotonicNow()}ms`;
+                    },
+                },
+            ]),
+        );
+        assert.ok(result.isOk(), `expected ok, got err: ${result.isErr() ? result.error.message : ""}`);
+        assert.deepStrictEqual(result.value, ["created", "settled at t=5ms"]);
+    });
+
+    // Same shape plus a later timer: after the settling timer fires, the
+    // scheduler must let the wake-up cascade drain rather than firing the
+    // later timer too — the waiter must observe t=5, not t=1000.
+    it("a later timer does not fire before a settling cascade has drained", async () => {
+        const sim = makeCrossTaskSim({ random: () => 0 });
+        let resolveShared!: (value: string) => void;
+        const shared = new Promise<string>((resolve) => {
+            resolveShared = resolve;
+        });
+        const result = await withHangGuard(
+            sim.runTasks([
+                {
+                    // Runs first (always-zero entropy), so its timer is
+                    // created first and the always-zero timer pick fires it
+                    // first.
+                    name: "creator",
+                    f: async (task: SimulationTask) => {
+                        const deadline = task.createDeadline(5, "settle shared");
+                        deadline.signal.addEventListener("abort", () => resolveShared("settled"), { once: true });
+                        return "created";
+                    },
+                },
+                {
+                    name: "sleeper",
+                    f: async (task: SimulationTask) => {
+                        await task.sleep(1_000, "long nap");
+                        return `woke at t=${task.monotonicNow()}ms`;
+                    },
+                },
+                {
+                    name: "waiter",
+                    f: async (task: SimulationTask) => {
+                        const value = await shared;
+                        return `${value} at t=${task.monotonicNow()}ms`;
+                    },
+                },
+            ]),
+        );
+        assert.ok(result.isOk(), `expected ok, got err: ${result.isErr() ? result.error.message : ""}`);
+        assert.deepStrictEqual(result.value, ["created", "woke at t=1000ms", "settled at t=5ms"]);
+    });
+
+    // Promises settled by the runtime itself — already resolved, or via
+    // queueMicrotask — resume their awaiters during the microtask drain,
+    // before the scheduler's quiescence check. None of these may be
+    // misreported as a deadlock.
+    it("promises settled outside the scheduler do not false-deadlock", async () => {
+        const sim = makeCrossTaskSim({ random: () => 0 });
+        const result = await withHangGuard(
+            sim.runTasks([
+                {
+                    name: "resolved",
+                    f: async (task: SimulationTask) => {
+                        await Promise.resolve();
+                        await task.checkpoint("mid");
+                        return await Promise.resolve("a");
+                    },
+                },
+                {
+                    name: "microtask",
+                    f: async () => {
+                        await new Promise<void>((resolve) => queueMicrotask(resolve));
+                        return "b";
+                    },
+                },
+                {
+                    name: "nested",
+                    f: async () => {
+                        return await Promise.resolve("c")
+                            .then((v) => v)
+                            .then((v) => Promise.resolve(v))
+                            .then((v) => v);
+                    },
+                },
+            ]),
+        );
+        assert.ok(result.isOk(), `expected ok, got err: ${result.isErr() ? result.error.message : ""}`);
+        assert.deepStrictEqual(result.value, ["a", "b", "c"]);
+    });
+
+    // A completed run may leave a quiescence probe pending. It must be
+    // inert: no entropy draws, no log output, no state mutation, and no
+    // poisoning of the instance.
+    it("pending probes from a completed run are inert", async () => {
+        const logger = new ArrayLogger();
+        // FixedEntropySource throws on any draw, so an extra draw from a
+        // post-completion probe would surface as a failure below.
+        const sim = new SimulationImpl(logger, new FixedEntropySource([]), () => 0);
+        const solo = {
+            name: "solo",
+            f: async (task: SimulationTask) => {
+                await task.sleep(1, "nap");
+                return "one";
+            },
+        };
+        const first = await withHangGuard(sim.runTasks([solo]));
+        assert.ok(first.isOk(), `expected ok, got err: ${first.isErr() ? first.error.message : ""}`);
+        const logCount = logger.logs.length;
+        // Let any pending probes fire.
+        await new Promise<void>((resolve) => setImmediate(() => setImmediate(resolve)));
+        assert.strictEqual(logger.logs.length, logCount, "a post-completion probe did something");
+        // Not poisoned: the instance is still usable.
+        const again = await withHangGuard(sim.runTasks([solo]));
+        assert.ok(again.isOk(), `expected ok, got err: ${again.isErr() ? again.error.message : ""}`);
+    });
+
+    // Back-to-back runs on one instance, where the second run starts while
+    // the first run's probe is still pending: the stale probe must not
+    // touch the new run's state, and the new run's own probes must work.
+    it("a stale probe from an earlier run does not affect a cross-task run started immediately", async () => {
+        const sim = makeCrossTaskSim({ random: () => 0 });
+        const first = await withHangGuard(
+            sim.runTasks([
+                {
+                    name: "solo",
+                    f: async (task: SimulationTask) => {
+                        await task.sleep(1, "nap");
+                        return "one";
+                    },
+                },
+            ]),
+        );
+        assert.ok(first.isOk(), `expected ok, got err: ${first.isErr() ? first.error.message : ""}`);
+
+        // No event-loop turn in between: run 2 starts with run 1's probe
+        // still in flight.
+        let shared: Promise<string> | undefined;
+        const second = await withHangGuard(
+            sim.runTasks([
+                {
+                    name: "owner",
+                    f: async (task: SimulationTask) => {
+                        shared = task.sleep(10, "work").then(() => "done");
+                        return await shared;
+                    },
+                },
+                {
+                    name: "waiter",
+                    f: async (task: SimulationTask) => {
+                        while (shared === undefined) await task.sleep(1, "poll");
+                        return await shared;
+                    },
+                },
+            ]),
+        );
+        assert.ok(second.isOk(), `expected ok, got err: ${second.isErr() ? second.error.message : ""}`);
+        assert.deepStrictEqual(second.value, ["done", "done"]);
+    });
+
+    // Fail-loudly half of the contract: a task suspended on a promise
+    // nobody will ever settle, with no pending timers, is a genuine
+    // deadlock. It must abort with a diagnostic naming the stuck task —
+    // never hang silently.
+    it("a task awaiting a promise nobody settles fails loudly instead of hanging", async () => {
+        const sim = makeCrossTaskSim({ random: () => 0 });
+        let resolveLate!: (value: string) => void;
+        const late = new Promise<string>((resolve) => {
+            resolveLate = resolve;
+        });
+        let zombieRan = false;
+        const result = await withHangGuard(
+            sim.runTasks([
+                {
+                    name: "finisher",
+                    f: async (task: SimulationTask) => {
+                        await task.checkpoint("step");
+                        return "finished";
+                    },
+                },
+                {
+                    name: "stuck",
+                    f: async () => {
+                        await late;
+                        zombieRan = true;
+                        return "unreachable";
+                    },
+                },
+            ]),
+        );
+        assert.ok(result.isErr(), "expected the simulation to report the deadlock");
+        assert.match(result.error.message, /[Dd]eadlock/);
+        assert.match(result.error.message, /stuck/);
+
+        // Like any failed run, a probe-detected deadlock poisons the
+        // instance.
+        const reused = await withHangGuard(sim.runTasks([{ name: "again", f: async () => "again" }]));
+        assert.ok(reused.isErr(), "expected the poisoned instance to fail");
+
+        // Settling the promise after the run failed resumes the abandoned
+        // task's code — that cannot be prevented, but it must not crash the
+        // process or produce an unhandled rejection.
+        resolveLate("too late");
+        await new Promise<void>((resolve) => setImmediate(() => setImmediate(resolve)));
+        assert.strictEqual(zombieRan, true, "the abandoned task's continuation should have run");
+    });
+
+    // A budget error raised while the scheduler advances time on behalf of
+    // a foreign-suspended task has no task stack to propagate through; it
+    // must still fail the run instead of hanging.
+    it("exceeding maxVirtualDurationMs while a task awaits a foreign promise fails the run", async () => {
+        const sim = new SimulationImpl(new ArrayLogger(), { random: () => 0 }, () => 0, {
+            maxVirtualDurationMs: 5,
+        });
+        let shared: Promise<string> | undefined;
+        const result = await withHangGuard(
+            sim.runTasks([
+                {
+                    name: "owner",
+                    f: async (task: SimulationTask) => {
+                        shared = task.sleep(10, "too long").then(() => "done");
+                        return await shared;
+                    },
+                },
+                {
+                    name: "waiter",
+                    f: async (task: SimulationTask) => {
+                        while (shared === undefined) await task.sleep(1, "poll");
+                        return await shared;
+                    },
+                },
+            ]),
+        );
+        assert.ok(result.isErr(), "expected the simulation to report the budget violation");
+        assert.match(result.error.message, /Maximum virtual duration/);
+    });
+
+    // The cross-task shape must stay deterministic: a recorded run replays
+    // identically, including the timer firings that resume foreign-blocked
+    // tasks.
+    it("cross-task awaits record and replay deterministically", async () => {
+        async function runScenario(
+            entropy: ConstructorParameters<typeof SimulationImpl>[1],
+        ): Promise<string[]> {
+            const events: string[] = [];
+            let shared: Promise<string> | undefined;
+            const sim = makeCrossTaskSim(entropy);
+            const result = await withHangGuard(
+                sim.runTasks([
+                    {
+                        name: "owner",
+                        f: async (task: SimulationTask) => {
+                            shared = task.sleep(10, "work").then(() => "done");
+                            const value = await shared;
+                            events.push(`owner got ${value} at t=${task.monotonicNow()}ms`);
+                        },
+                    },
+                    {
+                        name: "waiterA",
+                        f: async (task: SimulationTask) => {
+                            while (shared === undefined) await task.sleep(1, "poll");
+                            const value = await shared;
+                            events.push(`waiterA got ${value} at t=${task.monotonicNow()}ms`);
+                        },
+                    },
+                    {
+                        name: "waiterB",
+                        f: async (task: SimulationTask) => {
+                            await task.sleep(3, "delay");
+                            const value = await defined(shared);
+                            events.push(`waiterB got ${value} at t=${task.monotonicNow()}ms`);
+                        },
+                    },
+                ]),
+            );
+            assert.ok(result.isOk(), `expected ok, got err: ${result.isErr() ? result.error.message : ""}`);
+            return events;
+        }
+
+        for (let iteration = 0; iteration < 10; iteration++) {
+            const recording = new RecordingTraceSource(new SimpleEntropySource());
+            const recorded = await runScenario(recording);
+            const replaying = new ReplayingTraceSource(recording.getTrace());
+            const replayed = await runScenario(replaying);
+            assert.deepStrictEqual(replayed, recorded);
+            replaying.assertFullyConsumed();
+        }
     });
 });
